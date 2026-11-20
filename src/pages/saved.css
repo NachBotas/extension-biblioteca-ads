@@ -45,3 +45,8 @@ h1 { margin: 0; font-size: 20px; font-weight: 800; letter-spacing: -.01em; }
   .search .input { width: 100%; }
   .grid { grid-template-columns: 1fr; }
 }
+
+.tr-details { margin: 0 12px 10px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-2); }
+.tr-details summary { display: flex; align-items: center; gap: 6px; padding: 8px 10px; cursor: pointer; font-size: 13px; font-weight: 600; color: var(--primary-600); }
+.tr-text-s { padding: 0 12px 8px; font-size: 13px; white-space: pre-wrap; max-height: 220px; overflow-y: auto; }
+.tr-details .btn { margin: 0 10px 10px; height: 28px; font-size: 12.5px; }

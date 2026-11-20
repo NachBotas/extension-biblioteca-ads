@@ -276,6 +276,7 @@
       { header: 'Alcance UE', width: 12, type: 'number', get: (a) => a.reach },
       { header: 'Título', width: 30, type: 'text', get: (a) => a.title },
       { header: 'Texto del anuncio', width: 60, type: 'text', wrap: true, get: (a) => a.body },
+      { header: 'Transcripción del video', width: 60, type: 'text', wrap: true, get: (a) => a.transcript },
       { header: 'Video (link temporal)', width: 18, type: 'link', get: (a) => (firstVideo(a) || {}).hd || (firstVideo(a) || {}).sd, linkText: () => 'Video' },
       { header: 'Imagen (link temporal)', width: 18, type: 'link', get: (a) => (firstImage(a) || {}).url || (firstVideo(a) || {}).poster, linkText: () => 'Imagen' },
     ];

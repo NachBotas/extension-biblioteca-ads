@@ -5,6 +5,11 @@
   $('panel').innerHTML = `${BAP.icon('filter', 16)}Ir a los filtros en esta pestaña`;
   $('saved').innerHTML = `${BAP.icon('bookmark', 16)}Ver anuncios guardados`;
   $('lib').innerHTML = `${BAP.icon('external', 14)}Ir a la Biblioteca de anuncios`;
+  $('opts').innerHTML = `${BAP.icon('note', 14)}Configurar transcripción de videos`;
+  $('opts').addEventListener('click', () => {
+    chrome.runtime.openOptionsPage();
+    window.close();
+  });
 
   const { saved } = await BAP.storage.load();
   $('n').textContent = Object.keys(saved).length;

@@ -234,3 +234,22 @@ a.btn, a.cta { text-decoration: none; }
 @media (prefers-reduced-motion: reduce) {
   .toast, .spinner { animation: none; }
 }
+
+/* ---------- Configuración de transcripción ---------- */
+.set { display: flex; flex-direction: column; gap: 12px; }
+.set-h { font-weight: 700; font-size: 14px; }
+.opts { display: flex; flex-direction: column; gap: 6px; }
+.opt { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius); cursor: pointer; background: var(--surface); }
+.opt:hover { border-color: var(--border-strong); }
+.opt.on { border-color: var(--primary); background: var(--primary-50); }
+.opt input { margin-top: 3px; accent-color: var(--primary); }
+.opt b { display: block; font-size: 13.5px; }
+.opt small { display: block; color: var(--muted); font-size: 12.5px; margin-top: 1px; }
+.set-sec { display: flex; flex-direction: column; gap: 6px; }
+.set .field { min-width: 0; }
+.set .input, .set .select { width: 100%; }
+.set-link { font-size: 12.5px; color: var(--primary-600); font-weight: 600; text-decoration: none; }
+.set-link:hover { text-decoration: underline; }
+.set-hint { margin: 0; font-size: 12.5px; color: var(--muted); }
+.set-err { margin: 0; font-size: 13px; color: var(--red); font-weight: 600; }
+.set-actions { display: flex; justify-content: flex-end; gap: 8px; }

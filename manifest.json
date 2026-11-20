@@ -2,16 +2,19 @@
   "manifest_version": 3,
   "name": "Biblioteca Ads Pro",
   "short_name": "Ads Pro",
-  "version": "1.3.0",
-  "description": "Filtrá la Biblioteca de anuncios de Meta por destino (perfil, mensaje, web), días activo y formato. Descargá videos, guardá anuncios y exportá a Excel.",
+  "version": "1.4.0",
+  "description": "Filtrá la Biblioteca de anuncios de Meta por destino (perfil, mensaje, web), días activo y formato. Descargá y transcribí videos, guardá anuncios y exportá a Excel.",
   "permissions": [
     "storage",
     "unlimitedStorage",
     "downloads",
-    "activeTab"
+    "activeTab",
+    "offscreen"
   ],
   "host_permissions": [
-    "https://*.fbcdn.net/*"
+    "https://*.fbcdn.net/*",
+    "https://api.openai.com/*",
+    "https://api.groq.com/*"
   ],
   "background": {
     "service_worker": "src/background.js"
@@ -49,6 +52,7 @@
       "js": [
         "src/shared/core.js",
         "src/shared/export.js",
+        "src/shared/settings.js",
         "src/shared/card.js",
         "src/content/content.js"
       ],
@@ -66,5 +70,12 @@
       ]
     }
   ],
-  "minimum_chrome_version": "111"
+  "minimum_chrome_version": "116",
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  },
+  "options_ui": {
+    "page": "src/pages/options.html",
+    "open_in_tab": true
+  }
 }

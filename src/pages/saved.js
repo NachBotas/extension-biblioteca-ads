@@ -26,6 +26,8 @@
 
   async function load() {
     const r = await BAP.storage.load();
+    const t = (await chrome.storage.local.get(BAP.TRANSCRIPTS_KEY))[BAP.TRANSCRIPTS_KEY] || {};
+    for (const id in r.saved) if (t[id] && t[id].text) r.saved[id] = Object.assign({}, r.saved[id], { transcript: t[id].text });
     state.saved = r.saved;
     state.folders = r.folders;
     render();
@@ -33,7 +35,7 @@
 
   chrome.storage.onChanged.addListener((ch, area) => {
     if (area !== 'local') return;
-    if (ch[BAP.STORAGE_KEYS.saved] || ch[BAP.STORAGE_KEYS.folders]) {
+    if (ch[BAP.STORAGE_KEYS.saved] || ch[BAP.STORAGE_KEYS.folders] || ch[BAP.TRANSCRIPTS_KEY]) {
       const active = document.activeElement;
       // No re-renderizar mientras se escribe una nota.
       if (active && active.dataset && active.dataset.role === 'note') {
@@ -113,6 +115,14 @@
       meta.className = 'saved-meta';
       meta.textContent = `Guardado el ${BAP.fmtDate(ad.savedAt)} · días contados hasta ese momento`;
       el.querySelector('.card-head').appendChild(meta);
+      if (ad.transcript) {
+        const d = document.createElement('details');
+        d.className = 'tr-details';
+        d.innerHTML = `<summary>${icon('note', 14)}Transcripción del video</summary><div class="tr-text-s"></div><button class="btn" data-copy-tr>${icon('copy', 13)}Copiar</button>`;
+        d.querySelector('.tr-text-s').textContent = ad.transcript;
+        d.querySelector('[data-copy-tr]').addEventListener('click', () => copy(ad.transcript, 'Transcripción copiada'));
+        el.querySelector('.card-foot').before(d);
+      }
       frag.appendChild(el);
     }
     grid.appendChild(frag);

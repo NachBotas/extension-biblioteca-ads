@@ -40,6 +40,12 @@
     drawerFolder: '__all',
     drawerText: '',
     searchKey: '',
+    transcripts: {}, // id -> { text, provider, at }
+    settings: null,
+    settingsConfigured: false,
+    trJobs: new Map(), // id -> { stage, loaded, total }
+    trErrors: new Map(), // id -> mensaje
+    modalId: null, // anuncio abierto en la ventana de transcripción ('settings' = solo configuración)
   };
 
   const native = { cards: new Map(), grid: null, flat: new Set(), ordered: new Set(), version: 0, flatVersion: -1, tbVersion: -1 };
@@ -123,6 +129,11 @@
       state.prefs = Object.assign(state.prefs, prefs);
       if (prefs.filters) state.filters = Object.assign(BAP.defaultFilters(), prefs.filters, { text: '' });
       if (prefs.sort) state.sort = prefs.sort;
+      const r = await chrome.storage.local.get(BAP.TRANSCRIPTS_KEY);
+      state.transcripts = r[BAP.TRANSCRIPTS_KEY] || {};
+      const st = await BAP.loadSettings();
+      state.settings = st.settings;
+      state.settingsConfigured = st.configured;
     } catch (e) {
       console.warn('[BAP] storage', e);
     }
@@ -140,6 +151,17 @@
       scheduleRender();
     }
     if (changes[k.folders]) state.folders = changes[k.folders].newValue || ['General'];
+    if (changes[BAP.TRANSCRIPTS_KEY]) {
+      const prev = state.transcripts;
+      state.transcripts = changes[BAP.TRANSCRIPTS_KEY].newValue || {};
+      for (const id of Object.keys(state.transcripts)) if ((prev[id] || {}).at !== state.transcripts[id].at) refreshBar(id);
+      if (state.modalId && state.modalId !== 'settings') renderModal();
+      if (state.drawerOpen) renderDrawer();
+    }
+    if (changes[BAP.SETTINGS_KEY]) {
+      state.settings = Object.assign({}, BAP.DEFAULT_SETTINGS, changes[BAP.SETTINGS_KEY].newValue || {});
+      state.settingsConfigured = true;
+    }
   });
 
   let prefsTimer = null;
@@ -202,7 +224,8 @@
 
   function exportAds(ads, format, opts = {}) {
     if (!ads.length) return toast('No hay anuncios para exportar', true);
-    BAP.exportAds(ads, format, Object.assign({ prefix: 'biblioteca-anuncios' }, opts));
+    const withTr = ads.map((a) => Object.assign({}, a, { transcript: (state.transcripts[a.id] || {}).text || a.transcript || '' }));
+    BAP.exportAds(withTr, format, Object.assign({ prefix: 'biblioteca-anuncios' }, opts));
     toast(`Exportados ${ads.length} anuncios a ${format === 'csv' ? 'CSV' : 'Excel'}`);
   }
 
@@ -347,6 +370,7 @@
         <div class="spacer"></div>
         <label class="search">${icon('search', 15)}<input class="input" type="search" placeholder="Buscar en estos resultados…" data-ref="search"></label>
         <button class="btn" data-action="open-drawer">${icon('bookmark', 15)}Guardados <span class="filter-count" data-ref="savedN">0</span></button>
+        <button class="btn btn-ghost" data-action="open-settings" title="Configurar la transcripción de videos">${icon('note', 15)}Transcripción</button>
         <button class="btn" data-action="close-overlay" data-ref="closeBtn" hidden>${icon('x', 15)}Cerrar</button>
       </div>
       <div class="tb-row">
@@ -426,6 +450,8 @@
     switch (action) {
       case 'open-drawer':
         return openDrawer(true);
+      case 'open-settings':
+        return openSettingsModal();
       case 'close-overlay':
         return setOverlay(false);
       case 'toggle-adv':
@@ -879,7 +905,20 @@
               <button class="btn btn-primary btn-lg" data-action="download-menu" title="Elegir qué archivo descargar">${icon('chevronDown', 16)}</button>
             </div>`
           : `<button class="btn btn-primary btn-lg btn-block" data-action="download" ${n ? '' : 'disabled'}>${icon('download', 16)}${dl}</button>`
-      }`;
+      }
+      ${transcribeButtonHtml(ad)}`;
+  }
+
+  function hasVideo(ad) {
+    return (ad.media || []).some((m) => m.type === 'video');
+  }
+
+  function transcribeButtonHtml(ad) {
+    if (!hasVideo(ad)) return '';
+    const job = state.trJobs.get(ad.id);
+    if (job) return `<button class="btn btn-block tr-btn busy" data-action="transcribe"><span class="spinner"></span>${esc(stageText(job, true))}</button>`;
+    if (state.transcripts[ad.id]) return `<button class="btn btn-block tr-btn done" data-action="transcribe">${icon('note', 15)}Ver transcripción</button>`;
+    return `<button class="btn btn-block tr-btn" data-action="transcribe">${icon('note', 15)}Transcribir video</button>`;
   }
 
   function buildCardBar(ad, root, details) {
@@ -904,6 +943,10 @@
       root.insertBefore(host, root.firstChild);
     }
     return host;
+  }
+
+  function refreshBar(id) {
+    return refreshSaved(id);
   }
 
   function refreshSaved(id) {
@@ -1114,6 +1157,8 @@
         return downloadAds([ad]);
       case 'download-menu':
         return openDownloadMenu(anchor, ad);
+      case 'transcribe':
+        return openTranscript(ad);
       case 'more':
         return openMoreMenu(anchor, ad);
     }
@@ -1164,6 +1209,9 @@
           <button class="btn btn-ghost" data-action="open-saved-page" title="Abre la página completa de guardados en otra pestaña">${icon('external', 14)}Página completa</button>
         </div>
       </aside>
+      <div class="modal-wrap" data-ref="modalWrap" data-action="close-modal" hidden>
+        <div class="modal" data-ref="modal" role="dialog" aria-modal="true" aria-label="Transcripción"></div>
+      </div>
       <div class="selbar" data-ref="selbar" hidden></div>
       <div class="toasts" data-ref="toasts"></div>`;
     root.appendChild(wrap);
@@ -1219,6 +1267,17 @@
     const action = btn.dataset.action;
     const value = btn.dataset.value;
     switch (action) {
+      case 'close-modal':
+        if (e.target === btn || btn.closest('.modal-x')) closeModal();
+        return;
+      case 'tr-start':
+        return startTranscription(modalAd(), value || undefined);
+      case 'tr-copy':
+        return copy((state.transcripts[state.modalId] || {}).text || '', 'Transcripción copiada');
+      case 'tr-settings':
+        return openSettingsModal(state.modalId);
+      case 'sel-transcribe':
+        return transcribeMany(selectedAds());
       case 'to-toolbar':
         return tb.host.scrollIntoView({ block: 'start', behavior: 'smooth' });
       case 'open-overlay':
@@ -1270,6 +1329,8 @@
           return openFolderMenu(btn, rec, (folder) => BAP.storage.patch(rec.id, { folder }).then(() => ensureFolder(folder)));
         case 's-delete':
           return unsave([rec.id]);
+        case 's-transcript':
+          return openTranscript(rec);
       }
       return;
     }
@@ -1305,6 +1366,7 @@
     const f = Object.assign(BAP.defaultFilters(), { text: state.drawerText });
     return Object.values(state.saved)
       .filter((a) => (state.drawerFolder === '__all' || a.folder === state.drawerFolder) && BAP.matches(a, f))
+      .map((a) => (state.transcripts[a.id] ? Object.assign({}, a, { transcript: state.transcripts[a.id].text }) : a))
       .sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0));
   }
 
@@ -1343,6 +1405,7 @@
               <a class="btn btn-soft" href="${esc(a.url)}" target="_blank" rel="noopener">${icon('external', 13)}Ver anuncio</a>
               <button class="btn" data-action="s-copy" title="Copiar link">${icon('link', 13)}</button>
               <button class="btn" data-action="s-download" title="Descargar">${icon('download', 13)}</button>
+              ${hasVideo(a) || state.transcripts[a.id] ? `<button class="btn ${state.transcripts[a.id] ? 'btn-soft' : ''}" data-action="s-transcript" title="${state.transcripts[a.id] ? 'Ver transcripción' : 'Transcribir video'}">${icon('note', 13)}</button>` : ''}
               <button class="btn" data-action="s-folder" title="Mover de carpeta">${icon('folder', 13)}<span>${esc(a.folder)}</span></button>
               <button class="btn btn-danger" data-action="s-delete" title="Eliminar">${icon('trash', 13)}</button>
             </div>
@@ -1368,6 +1431,7 @@
       <button class="btn" data-action="sel-save">${icon('bookmark', 14)}Guardar</button>
       <button class="btn" data-action="sel-export">${icon('sheet', 14)}Excel</button>
       <button class="btn" data-action="sel-copy">${icon('link', 14)}Copiar links</button>
+      <button class="btn" data-action="sel-transcribe">${icon('note', 14)}Transcribir</button>
       <button class="btn" data-action="sel-clear" title="Quitar selección">${icon('x', 14)}</button>`;
   }
 
@@ -1459,6 +1523,165 @@
     else if (state.ads.size && state.hasNext !== false) html = busy ? `<span class="btn" style="pointer-events:none"><span class="spinner"></span>Cargando más anuncios…</span>` : '';
     else if (state.ads.size && state.hasNext === false) html = `<div class="hint">No hay más resultados para esta búsqueda.</div>`;
     layer.loadmore.innerHTML = html;
+  }
+
+  // ---------- Transcripción ----------
+  let modalAdRef = null;
+  function modalAd() {
+    return modalAdRef;
+  }
+
+  function stageText(job, short) {
+    switch (job.stage) {
+      case 'queued':
+      case 'start':
+        return short ? 'En espera…' : 'En la cola…';
+      case 'video':
+        return short ? 'Bajando video…' : 'Bajando el video…';
+      case 'audio':
+        return short ? 'Leyendo audio…' : 'Leyendo el audio…';
+      case 'model': {
+        const mb = (b) => Math.round(b / 1048576);
+        return short
+          ? `Modelo ${job.total ? Math.round((job.loaded / job.total) * 100) : 0}%`
+          : `Bajando el modelo de voz: ${mb(job.loaded || 0)} de ${mb(job.total || 0)} MB (solo la primera vez)…`;
+      }
+      case 'transcribe':
+        return short ? 'Transcribiendo…' : `Transcribiendo${job.provider ? ' con ' + (BAP.PROVIDER_NAMES[job.provider] || job.provider) : ''}…`;
+      default:
+        return 'Procesando…';
+    }
+  }
+
+  function onTranscribeProgress(msg) {
+    const id = String(msg.id);
+    if (msg.stage === 'done' || msg.stage === 'error') return; // el resultado llega por la respuesta
+    const prev = state.trJobs.get(id) || {};
+    state.trJobs.set(id, Object.assign({}, prev, msg));
+    updateTranscribeUI(id);
+  }
+
+  function updateTranscribeUI(id) {
+    const c = native.cards.get(id);
+    if (c) {
+      const btn = c.host.shadowRoot.querySelector('.tr-btn');
+      const ad = state.ads.get(id);
+      if (btn && ad) btn.outerHTML = transcribeButtonHtml(ad);
+    }
+    if (state.modalId === id) renderModal();
+    if (state.drawerOpen) renderDrawer();
+  }
+
+  function openTranscript(ad) {
+    modalAdRef = ad;
+    state.modalId = ad.id;
+    layer.modalWrap.hidden = false;
+    closeMenu();
+    const ready = state.settingsConfigured && BAP.isTranscribeReady(state.settings);
+    if (!state.transcripts[ad.id] && !state.trJobs.has(ad.id) && !state.trErrors.has(ad.id) && ready) startTranscription(ad);
+    else renderModal();
+  }
+
+  function openSettingsModal(returnTo) {
+    modalAdRef = returnTo && returnTo !== 'settings' ? modalAdRef : null;
+    state.modalId = 'settings';
+    layer.modalWrap.hidden = false;
+    closeMenu();
+    layer.modal.innerHTML = `
+      <div class="modal-h"><div><div class="modal-t">Transcripción de videos</div><div class="modal-s">Se usa para el botón “Transcribir video” de cada anuncio.</div></div>
+        <button class="icon-btn modal-x" data-action="close-modal" title="Cerrar (Esc)">${icon('x', 18)}</button></div>
+      <div class="modal-b">${BAP.settingsFormHtml(state.settings || BAP.DEFAULT_SETTINGS, modalAdRef ? 'Guardar y transcribir' : 'Guardar')}</div>`;
+    BAP.bindSettingsForm(layer.modal.querySelector('form'), (st) => {
+      state.settings = st;
+      state.settingsConfigured = true;
+      const ad = modalAdRef;
+      if (ad) {
+        state.trErrors.delete(ad.id);
+        openTranscript(ad);
+        if (!state.trJobs.has(ad.id)) startTranscription(ad);
+      } else {
+        closeModal();
+        toast('Configuración guardada');
+      }
+    });
+  }
+
+  function closeModal() {
+    state.modalId = null;
+    modalAdRef = null;
+    layer.modalWrap.hidden = true;
+    layer.modal.innerHTML = '';
+  }
+
+  function renderModal() {
+    const ad = modalAdRef;
+    if (!ad || state.modalId !== ad.id) return;
+    const tr = state.transcripts[ad.id];
+    const job = state.trJobs.get(ad.id);
+    const err = state.trErrors.get(ad.id);
+    const ready = state.settingsConfigured && BAP.isTranscribeReady(state.settings);
+    const head = `<div class="modal-h"><div><div class="modal-t">Transcripción</div><div class="modal-s">${esc(ad.pageName)} · ID ${esc(ad.id)}</div></div>
+      <button class="icon-btn modal-x" data-action="close-modal" title="Cerrar (Esc)">${icon('x', 18)}</button></div>`;
+    let body = '';
+    let foot = '';
+    if (job) {
+      const pct = job.stage === 'model' && job.total ? Math.round((job.loaded / job.total) * 100) : null;
+      body = `<div class="tr-progress"><span class="spinner"></span><span>${esc(stageText(job))}</span></div>
+        ${pct != null ? `<div class="bar"><span style="width:${pct}%"></span></div>` : ''}
+        <p class="set-hint">Podés cerrar esta ventana: la transcripción sigue y el botón del anuncio cambia a “Ver transcripción” cuando termina.</p>`;
+    } else if (tr) {
+      const when = BAP.fmtDate(tr.at);
+      body = tr.text
+        ? `<div class="tr-text">${esc(tr.text)}</div>`
+        : `<div class="empty" style="padding:24px 10px"><h3>Sin texto</h3><p>${esc(tr.note || 'No se detectó voz en el video.')}</p></div>`;
+      body += `<p class="set-hint">Transcripto con ${esc(BAP.PROVIDER_NAMES[tr.provider] || tr.provider)} el ${when}.</p>`;
+      foot = `<button class="btn btn-ghost" data-action="tr-settings">${icon('note', 14)}Configuración</button><div class="spacer"></div>
+        <button class="btn" data-action="tr-start">${icon('refresh', 14)}Volver a transcribir</button>
+        ${tr.text ? `<button class="btn btn-primary" data-action="tr-copy">${icon('copy', 14)}Copiar texto</button>` : ''}`;
+    } else if (err) {
+      const needKey = /^NO_KEY:/.test(err);
+      body = `<div class="tr-error">${icon('x', 16)}<span>${esc(err.replace(/^NO_KEY:\s*/, ''))}</span></div>`;
+      foot = `<button class="btn ${needKey ? 'btn-primary' : ''}" data-action="tr-settings">${icon('note', 14)}Configuración</button><div class="spacer"></div>
+        ${needKey ? '' : `<button class="btn btn-primary" data-action="tr-start">${icon('refresh', 14)}Reintentar</button>`}`;
+    } else if (!ready) {
+      return openSettingsModal(ad.id);
+    } else {
+      body = `<div class="tr-progress"><span class="spinner"></span><span>Preparando…</span></div>`;
+    }
+    layer.modal.innerHTML = `${head}<div class="modal-b">${body}</div>${foot ? `<div class="modal-f">${foot}</div>` : ''}`;
+  }
+
+  async function startTranscription(ad) {
+    if (!ad) return;
+    const v = (ad.media || []).find((m) => m.type === 'video');
+    if (!v) return toast('Este anuncio no tiene video', true);
+    if (state.trJobs.has(ad.id)) return;
+    state.trErrors.delete(ad.id);
+    state.trJobs.set(ad.id, { stage: 'queued' });
+    updateTranscribeUI(ad.id);
+    let r;
+    try {
+      r = await chrome.runtime.sendMessage({ type: 'transcribe', id: ad.id, video: { sd: v.sd, hd: v.hd, url: v.url } });
+    } catch (e) {
+      r = { ok: false, error: 'Se interrumpió la transcripción. Probá de nuevo.' };
+    }
+    state.trJobs.delete(ad.id);
+    if (r && r.ok) {
+      state.transcripts[ad.id] = { text: r.text, note: r.note, provider: r.provider, at: r.at };
+      if (state.modalId !== ad.id) toast(r.text ? `Transcripción lista: ${ad.pageName}` : `Sin voz en el video de ${ad.pageName}`, false, { label: 'Ver', fn: () => openTranscript(ad) });
+    } else {
+      state.trErrors.set(ad.id, (r && r.error) || 'No se pudo transcribir.');
+      if (state.modalId !== ad.id) toast(`No se pudo transcribir: ${ad.pageName}`, true, { label: 'Ver', fn: () => openTranscript(ad) });
+    }
+    updateTranscribeUI(ad.id);
+  }
+
+  function transcribeMany(ads) {
+    const list = ads.filter((a) => hasVideo(a) && !state.transcripts[a.id] && !state.trJobs.has(a.id));
+    if (!list.length) return toast('Los anuncios seleccionados no tienen videos pendientes de transcribir', true);
+    if (!(state.settingsConfigured && BAP.isTranscribeReady(state.settings))) return openSettingsModal();
+    toast(`Transcribiendo ${list.length} video${list.length > 1 ? 's' : ''}, de a uno…`);
+    list.forEach((a) => startTranscription(a));
   }
 
   // ---------- Menús ----------
@@ -1615,6 +1838,7 @@
 
   function handleEscape() {
     if (menu) closeMenu();
+    else if (state.modalId) closeModal();
     else if (state.drawerOpen) openDrawer(false);
     else if (state.overlayOpen) setOverlay(false);
     else return false;
@@ -1632,6 +1856,7 @@
   });
 
   chrome.runtime.onMessage.addListener((msg) => {
+    if (msg && msg.type === 'transcribe-progress') return onTranscribeProgress(msg);
     if (!msg || !tb) return;
     if (msg.type === 'open-drawer') openDrawer(true);
     if (msg.type === 'toggle-panel') {
