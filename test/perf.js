@@ -12,6 +12,7 @@ const N = Number(process.argv[3] || 120);
 const FIX = path.join(__dirname, 'fixtures');
 const FILLER = Number(process.env.FILLER || 0); // elementos extra por tarjeta (Facebook usa muchos)
 const DIGIT_NOISE = !!process.env.DIGIT_NOISE; // cambios que incluyen números largos
+const RERENDER = !!process.env.RERENDER; // Facebook vuelve a dibujar partes de las tarjetas (hover, videos)
 const ads = Array.from({ length: N }, (_, i) => makeAd(i, { offset: Math.floor(i / 12) * 100000 }));
 
 const html = `<!doctype html><html><head><meta charset="utf-8"><style>
@@ -31,6 +32,7 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>
  const t=document.getElementById('ticker'); let k=0;
  setInterval(()=>{k++; t.textContent='tick '+k; const s=document.createElement('span'); s.textContent='tooltip '+k; document.body.appendChild(s); setTimeout(()=>s.remove(),30);
    document.querySelectorAll('.media').forEach((m,i)=>{ if(i%10===k%10){ m.innerHTML='<i>'+k+'</i>'; } });
+   if (${RERENDER} && k%6===0){ const cards=document.querySelectorAll('.card'); const c=cards[(k*7)%cards.length]; const inner=c.querySelector('.inner'); const fresh=inner.cloneNode(true); fresh.querySelectorAll('bap-cardbar').forEach((e)=>e.remove()); inner.replaceWith(fresh); }
    if (${DIGIT_NOISE} && k%20===0){ const d=document.createElement('div'); d.textContent='ref 98765432101234'+k; document.body.appendChild(d); setTimeout(()=>d.remove(),200); } }, 16);
 </script></body></html>`;
 
@@ -43,6 +45,8 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>
   await ctx.route('https://www.facebook.com/ads/library/**', (r) => r.fulfill({ contentType: 'text/html', body: html }));
   await ctx.route(/fbcdn\.net/, (r) => r.fulfill({ contentType: 'image/jpeg', body: fs.readFileSync(path.join(FIX, 'img1.jpg')) }));
   const p = await ctx.newPage();
+  const logs = [];
+  p.on('console', (m) => m.text().startsWith('[BAP]') && logs.push(m.text()));
   const cdp = await ctx.newCDPSession(p);
   await cdp.send('Performance.enable');
   const tLoad = Date.now();
@@ -85,5 +89,6 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>
   });
 
   console.log(JSON.stringify({ anuncios: N, listo_ms: readyMs, reposo5s_ms: Object.fromEntries(Object.entries(idle).map(([k, v]) => [k, Math.round(v * 1000)])), filtro_ms: filt, orden_ms: sortMs, ...check }));
+  if (process.env.SHOW_LOGS) console.log(logs.slice(-6).join('\n'));
   await ctx.close();
 })().catch((e) => { console.error(e); process.exit(1); });

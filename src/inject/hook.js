@@ -9,13 +9,16 @@
   window.__BAP_HOOKED__ = true;
 
   const TAG = 'BAP_HOOK';
-  const buffer = []; // mensajes ya enviados, por si el content script se carga después
-  const MAX_BUFFER = 400;
+  let buffer = []; // mensajes enviados antes de que el content script esté escuchando
+  const MAX_BUFFER = 200;
+  let listening = false;
 
   function post(type, payload) {
     const msg = { source: TAG, type, payload };
-    buffer.push(msg);
-    if (buffer.length > MAX_BUFFER) buffer.shift();
+    if (!listening) {
+      buffer.push(msg);
+      if (buffer.length > MAX_BUFFER) buffer.shift();
+    }
     try {
       window.postMessage(msg, location.origin);
     } catch (e) {
@@ -28,6 +31,9 @@
     if (ev.source !== window || !ev.data || ev.data.source !== 'BAP_CS') return;
     if (ev.data.type === 'hello') {
       for (const msg of buffer) window.postMessage(msg, location.origin);
+      // Ya escucha: liberamos la memoria y no guardamos más copias.
+      buffer = [];
+      listening = true;
     } else if (ev.data.type === 'rescan') {
       // Hay tarjetas en pantalla sin datos: revisamos scripts de datos que llegaron tarde.
       scanScripts();

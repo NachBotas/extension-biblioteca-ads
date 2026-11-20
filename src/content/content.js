@@ -65,6 +65,8 @@
   });
   state.searchKey = searchKey();
   window.postMessage({ source: 'BAP_CS', type: 'hello' }, location.origin);
+  // Por si el interceptor arrancó después que nosotros: volvemos a avisar cuando carga la página.
+  document.addEventListener('DOMContentLoaded', () => window.postMessage({ source: 'BAP_CS', type: 'hello' }, location.origin), { once: true });
 
   function ingest(payload) {
     const now = Date.now();
@@ -85,7 +87,10 @@
       if (payload.meta.hasNext != null) state.hasNext = payload.meta.hasNext;
     }
     if (added) {
-      scheduleScan(true);
+      for (const tn of waiting) if (tn.isConnected) pendingNodes.add(tn);
+      waiting.clear();
+      const needAll = !native.cards.size && Date.now() - lastFullAt > 2500;
+      scheduleScan(needAll);
       scheduleRender();
     } else scheduleRender();
   }
@@ -279,8 +284,9 @@
       display: grid !important; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)) !important;
       gap: 16px !important; align-items: start !important;
     }
-    [data-bap-grid] > :not([data-bap-card]):not([data-bap-flat]),
-    [data-bap-flat] > :not([data-bap-card]):not([data-bap-flat]) { grid-column: 1 / -1 !important; }
+    /* Encabezados y "cargando…" dentro de la grilla ordenada ocupan todo el ancho.
+       (Marcados uno por uno: un selector con :not() se evaluaría en cada elemento de Facebook.) */
+    [data-bap-other] { grid-column: 1 / -1 !important; }
     [data-bap-grid] > [data-bap-card], [data-bap-flat] > [data-bap-card] {
       width: auto !important; max-width: none !important; min-width: 0 !important; margin: 0 !important; flex: none !important;
     }
@@ -649,10 +655,22 @@
   let scanTimer = null;
   let lastScanAt = 0;
   let needFull = false;
+  let lastFullAt = 0;
   const pendingNodes = new Set();
+  const waiting = new Set(); // textos "Identificador: …" que llegaron antes que sus datos
+  const perf = { scans: 0, full: 0, reattached: 0, ms: 0 };
+  // Resumen en la consola (nivel "Detallado") para diagnosticar lentitud.
+  setInterval(() => {
+    if (!perf.scans && !perf.reattached) return;
+    console.debug(`[BAP] últimos 10 s: ${perf.scans} revisiones (${perf.full} completas), ${perf.reattached} barras repuestas, ${perf.ms.toFixed(0)} ms en total`);
+    perf.scans = perf.full = perf.reattached = perf.ms = 0;
+  }, 10000);
   // full = revisar toda la página (cuando llegan datos nuevos). Si no, solo lo que agregó Facebook.
   function scheduleScan(full = true) {
-    if (full) needFull = true;
+    if (full) {
+      needFull = true;
+      lastFullAt = Date.now();
+    }
     if (scanTimer) return;
     const wait = Math.max(60, 450 - (performance.now() - lastScanAt));
     scanTimer = setTimeout(() => {
@@ -669,10 +687,19 @@
     window.postMessage({ source: 'BAP_CS', type: 'rescan' }, location.origin);
   }
 
+  // Facebook redibuja partes de las tarjetas seguido (hover, videos). Si borró nuestros botones
+  // pero la tarjeta sigue, los volvemos a poner ahí mismo: sin revisar toda la página.
   function purgeCards() {
     let changed = false;
     for (const [id, c] of native.cards) {
       if (c.root.isConnected && c.host.isConnected) continue;
+      if (c.root.isConnected && c.root.getAttribute('data-bap-card') === id) {
+        const details = findDetailsButton(c.root);
+        if (details && details.parentElement && c.root.contains(details)) details.parentElement.insertBefore(c.host, details);
+        else c.root.insertBefore(c.host, c.root.firstChild);
+        perf.reattached++;
+        continue;
+      }
       if (c.root.isConnected) {
         c.root.removeAttribute('data-bap-card');
         c.root.removeAttribute('data-bap-hide');
@@ -761,13 +788,15 @@
     if (!document.body) return;
     const t0 = performance.now();
     const purged = purgeCards();
-    // Si Facebook volvió a dibujar tarjetas, revisamos toda la página para reconectarlas.
-    const full = needFull || purged;
+    const full = needFull;
     needFull = false;
     const nodes = full ? [document.body] : [...pendingNodes].filter((n) => n.isConnected);
     pendingNodes.clear();
+    perf.scans++;
+    if (full) perf.full++;
     if (!state.ads.size || !nodes.length) {
       if (purged) scheduleRender();
+      perf.ms += performance.now() - t0;
       return;
     }
 
@@ -781,7 +810,10 @@
       if (!m) continue;
       const ids = m.filter((x) => state.ads.has(x));
       if (ids.length !== 1) {
-        if (!ids.length && ID_LABEL.test(tn.data.trim())) unknown++;
+        if (!ids.length && ID_LABEL.test(tn.data.trim())) {
+          unknown++;
+          if (waiting.size < 3000) waiting.add(tn);
+        }
         continue;
       }
       if (native.cards.has(ids[0])) continue;
@@ -814,6 +846,7 @@
     if (plans.length || purged) scheduleRender();
     updateFallback();
     const dt = performance.now() - t0;
+    perf.ms += dt;
     if (dt > 40) console.debug(`[BAP] scan ${full ? 'completo' : 'parcial'} ${dt.toFixed(0)}ms · ${plans.length} tarjetas nuevas · ${native.cards.size} total`);
   }
 
@@ -971,7 +1004,10 @@
     // Lo que no es tarjeta (encabezados, "cargando…") va arriba o abajo de la grilla.
     let first = roots[0];
     for (const r of roots) if (r.compareDocumentPosition(first) & Node.DOCUMENT_POSITION_FOLLOWING) first = r;
-    for (const el of native.ordered) el.style.removeProperty('order');
+    for (const el of native.ordered) {
+      el.style.removeProperty('order');
+      el.removeAttribute('data-bap-other');
+    }
     native.ordered = new Set();
     const parents = [common, ...flat];
     for (const par of parents) {
@@ -979,6 +1015,7 @@
         if (el.hasAttribute('data-bap-card') || el.hasAttribute('data-bap-flat')) continue;
         const before = el.compareDocumentPosition(first) & Node.DOCUMENT_POSITION_FOLLOWING;
         el.style.setProperty('order', before ? '-1' : '1000000');
+        el.setAttribute('data-bap-other', '');
         native.ordered.add(el);
       }
     }
@@ -989,7 +1026,10 @@
     native.flat = new Set();
     if (native.grid) native.grid.removeAttribute('data-bap-grid');
     native.grid = null;
-    for (const el of native.ordered) el.style.removeProperty('order');
+    for (const el of native.ordered) {
+      el.style.removeProperty('order');
+      el.removeAttribute('data-bap-other');
+    }
     native.ordered = new Set();
     native.flatVersion = -1;
   }
@@ -1015,8 +1055,12 @@
   function wantsNode(text) {
     if (!HAS_ID.test(text)) return false;
     const m = text.match(LONG_NUM) || [];
-    for (const x of m) if (state.ads.has(x) && !native.cards.has(x)) return true;
-    // "Identificador…: 123…" de un anuncio sin datos todavía: sirve para pedir una relectura.
+    for (const x of m) {
+      if (!state.ads.has(x)) continue;
+      const c = native.cards.get(x);
+      if (!c || !c.root.isConnected) return true; // anuncio sin botones, o tarjeta redibujada
+    }
+    // "Identificador…: 123…" de un anuncio cuyos datos todavía no llegaron.
     return /:\s*\d{13,20}/.test(text) && m.some((x) => !state.ads.has(x));
   }
   function observePage() {
@@ -1038,7 +1082,7 @@
         if (native.cards.size && !schedule) {
           for (const node of m.removedNodes) {
             if (node.nodeType !== 1 || node.localName.startsWith('bap-')) continue;
-            if (node.hasAttribute('data-bap-card') || node.querySelector('[data-bap-card]')) {
+            if (node.hasAttribute('data-bap-card') || node.querySelector('[data-bap-card], bap-cardbar')) {
               schedule = true;
               break;
             }
