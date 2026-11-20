@@ -182,8 +182,8 @@
 
   // ======================= Descargas / exportación =======================
 
-  async function downloadAds(ads) {
-    const items = ads.flatMap((ad) => BAP.downloadItems(ad));
+  async function downloadAds(ads, only) {
+    const items = ads.flatMap((ad) => BAP.downloadItems(ad, only));
     if (!items.length) return toast('No hay archivos para descargar', true);
     if (items.length > 25 && !confirm(`Se van a descargar ${items.length} archivos. ¿Continuar?`)) return;
     toast(items.length > 1 ? `Descargando ${items.length} archivos…` : 'Descargando…');
@@ -823,7 +823,7 @@
     const destTitle = ad.channel && ad.channel !== dest.label ? `${dest.label} · ${ad.channel}` : dest.label;
     const sv = state.saved[ad.id];
     const n = (ad.media || []).length;
-    const dl = !n ? 'Sin archivos' : n > 1 ? `Descargar (${n})` : ad.media[0].type === 'video' ? 'Descargar video' : 'Descargar imagen';
+    const dl = BAP.downloadLabel(ad);
     return `
       <div class="nb-kpis">
         <span class="days ${BAP.daysTone(ad.days)}" title="Días en circulación">${icon(ad.days >= 30 ? 'flame' : 'clock', 14)}${BAP.fmtDays(ad.days)}</span>
@@ -839,7 +839,14 @@
           <button class="btn ${sv ? 'saved' : 'btn-soft'}" data-action="save-menu" title="Elegir carpeta">${icon('chevronDown', 15)}</button>
         </div>
       </div>
-      <button class="btn btn-primary btn-lg btn-block" data-action="download" ${n ? '' : 'disabled'}>${icon('download', 16)}${dl}</button>`;
+      ${
+        n > 1
+          ? `<div class="split dl-split">
+              <button class="btn btn-primary btn-lg" data-action="download" title="Descarga todos los archivos del anuncio">${icon('download', 16)}<span>${dl}</span></button>
+              <button class="btn btn-primary btn-lg" data-action="download-menu" title="Elegir qué archivo descargar">${icon('chevronDown', 16)}</button>
+            </div>`
+          : `<button class="btn btn-primary btn-lg btn-block" data-action="download" ${n ? '' : 'disabled'}>${icon('download', 16)}${dl}</button>`
+      }`;
   }
 
   function buildCardBar(ad, root, details) {
@@ -1061,6 +1068,8 @@
         return openFolderMenu(anchor, ad, (folder) => saveAds([ad], folder));
       case 'download':
         return downloadAds([ad]);
+      case 'download-menu':
+        return openDownloadMenu(anchor, ad);
       case 'more':
         return openMoreMenu(anchor, ad);
     }
@@ -1134,8 +1143,14 @@
       clearTimeout(t._timer);
       t._timer = setTimeout(() => BAP.storage.patch(id, { note: t.value }), 500);
     });
-    refs.overlay.addEventListener('scroll', () => closeMenu(), { passive: true });
-    window.addEventListener('scroll', () => closeMenu(), { passive: true });
+    // Cierra el menú solo si se scrollea de verdad (no por un ajuste chico al hacer clic).
+    const closeOnScroll = () => {
+      if (!menu) return;
+      const y = state.overlayOpen ? refs.overlay.scrollTop : window.scrollY;
+      if (Math.abs(y - (menu._scrollY ?? y)) > 40) closeMenu();
+    };
+    refs.overlay.addEventListener('scroll', closeOnScroll, { passive: true });
+    window.addEventListener('scroll', closeOnScroll, { passive: true });
 
     new IntersectionObserver(
       (entries) => {
@@ -1418,6 +1433,7 @@
     if (top + m.offsetHeight > window.innerHeight - 8) top = Math.max(8, r.top - m.offsetHeight - 6);
     m.style.left = left + 'px';
     m.style.top = top + 'px';
+    m._scrollY = state.overlayOpen ? layer.overlay.scrollTop : window.scrollY;
     menu = m;
   }
 
@@ -1450,6 +1466,34 @@
       if (!name) return;
       closeMenu();
       onPick(name);
+    });
+    placeMenu(m, anchor);
+  }
+
+  function openDownloadMenu(anchor, ad) {
+    closeMenu();
+    const m = document.createElement('div');
+    m.className = 'menu';
+    const media = ad.media || [];
+    m.innerHTML =
+      `<div class="mh">Elegí qué descargar</div>` +
+      media
+        .map((x, i) => {
+          const thumb = x.poster || (x.type === 'image' ? x.url : '');
+          return `<button class="mi mi-media" data-i="${i}">${
+            thumb ? `<img src="${esc(thumb)}" alt="" referrerpolicy="no-referrer">` : icon(x.type === 'video' ? 'video' : 'image', 15)
+          }<span>${esc(BAP.mediaItemLabel(ad, i))}${x.type === 'video' && x.hd ? ' · HD' : ''}</span></button>`;
+        })
+        .join('') +
+      `<div class="sep"></div><button class="mi" data-i="all">${icon('download', 15)}${esc(BAP.downloadLabel(ad))}</button>`;
+    m.querySelectorAll('img').forEach((img) => img.addEventListener('error', () => img.remove()));
+    m.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const b = e.target.closest('[data-i]');
+      if (!b) return;
+      closeMenu();
+      if (b.dataset.i === 'all') downloadAds([ad]);
+      else downloadAds([ad], Number(b.dataset.i));
     });
     placeMenu(m, anchor);
   }

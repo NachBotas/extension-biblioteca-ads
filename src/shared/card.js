@@ -14,12 +14,7 @@
     return `<span class="avatar avatar-fallback">${initial}</span>`;
   }
 
-  function downloadLabel(ad) {
-    const n = (ad.media || []).length;
-    if (!n) return 'Sin archivos';
-    if (n > 1) return `Descargar (${n})`;
-    return ad.media[0].type === 'video' ? 'Descargar video' : 'Descargar imagen';
-  }
+  const downloadLabel = (ad) => BAP.downloadLabel(ad);
 
   BAP.mediaHtml = function (ad, index = 0, opts = {}) {
     const media = ad.media || [];

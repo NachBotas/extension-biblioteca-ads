@@ -32,6 +32,12 @@
 .nb-kpis .spacer { flex: 1; }
 .nb .icon-btn { width: 28px; height: 28px; }
 
+/* Descarga con menú (anuncios con varios archivos) */
+.dl-split .btn-primary + .btn-primary { border-left: 1px solid rgba(255, 255, 255, .35); }
+.dl-split .btn-primary:first-child { flex: 1; }
+.menu .mi-media { height: 44px; }
+.menu .mi-media img { width: 28px; height: 36px; object-fit: cover; border-radius: 4px; flex: none; }
+
 /* ---------- Pastilla flotante para volver a los filtros ---------- */
 .pill {
   position: fixed; z-index: 2147483000; right: 22px; bottom: 22px; display: inline-flex; align-items: center; gap: 7px;

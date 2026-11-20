@@ -137,34 +137,58 @@
     return '';
   }
 
+  // Clave de un archivo de Facebook: la ruta sin parámetros (el mismo archivo llega con distintos ?_nc_…).
+  function fileKey(url) {
+    try {
+      return new URL(url).pathname;
+    } catch (e) {
+      return String(url || '').split('?')[0];
+    }
+  }
+
+  /**
+   * Junta los archivos del anuncio sin repetidos. Facebook suele mandar el mismo video
+   * varias veces (HD/SD, en `videos`, en `cards`, en `extra_videos`) y su miniatura como imagen aparte.
+   */
   function collectMedia(s) {
     const out = [];
     const seen = new Set();
+    const has = (...urls) => urls.some((u) => u && seen.has(fileKey(u)));
+    const mark = (...urls) => urls.forEach((u) => u && seen.add(fileKey(u)));
+
     const addVideo = (o) => {
-      const url = o.video_hd_url || o.video_sd_url;
-      if (!url || seen.has(url)) return;
-      seen.add(url);
-      out.push({
-        type: 'video',
-        url,
-        hd: o.video_hd_url || null,
-        sd: o.video_sd_url || null,
-        poster: o.video_preview_image_url || o.resized_image_url || o.original_image_url || null,
-      });
+      const hd = o.video_hd_url || o.watermarked_video_hd_url || null;
+      const sd = o.video_sd_url || o.watermarked_video_sd_url || null;
+      const poster = o.video_preview_image_url || o.resized_image_url || o.original_image_url || null;
+      if (!hd && !sd) return;
+      // Mismo video ya agregado (por su archivo o por su miniatura).
+      if (has(hd, sd) || (poster && out.some((m) => m.type === 'video' && m.poster && fileKey(m.poster) === fileKey(poster)))) {
+        mark(hd, sd);
+        return;
+      }
+      mark(hd, sd, poster);
+      out.push({ type: 'video', url: hd || sd, hd, sd, poster });
     };
     const addImage = (o) => {
       const url = o.original_image_url || o.resized_image_url || o.watermarked_resized_image_url;
-      if (!url || seen.has(url)) return;
-      seen.add(url);
+      if (!url || has(url, o.resized_image_url)) return;
+      mark(url, o.resized_image_url);
       out.push({ type: 'image', url, poster: o.resized_image_url || url });
     };
     const each = (arr, fn) => Array.isArray(arr) && arr.forEach((x) => x && typeof x === 'object' && fn(x));
 
     each(s.videos, addVideo);
-    each(s.cards, (c) => (c.video_hd_url || c.video_sd_url ? addVideo(c) : addImage(c)));
-    each(s.images, addImage);
+    each(s.cards, (c) => (c.video_hd_url || c.video_sd_url || c.watermarked_video_hd_url ? addVideo(c) : null));
     each(s.extra_videos, addVideo);
-    each(s.extra_images, addImage);
+
+    // En un anuncio de video, las imágenes suelen ser la portada del video: no son otro archivo.
+    const fmt = String(s.display_format || '').toUpperCase();
+    const mixed = /CAROUSEL|DCO|DPA|MULTI/.test(fmt);
+    if (!out.length || mixed) {
+      each(s.cards, (c) => (c.video_hd_url || c.video_sd_url || c.watermarked_video_hd_url ? null : addImage(c)));
+      each(s.images, addImage);
+      each(s.extra_images, addImage);
+    }
     return out;
   }
 
@@ -352,15 +376,37 @@
     return type === 'video' ? 'mp4' : 'jpg';
   };
 
-  /** Arma la lista de archivos a descargar de un anuncio. */
-  BAP.downloadItems = function (ad) {
+  /** Arma la lista de archivos a descargar de un anuncio (todos, o solo el índice pedido). */
+  BAP.downloadItems = function (ad, only) {
     const base = `${BAP.sanitizeFilename(BAP.APP_NAME)}/${BAP.sanitizeFilename(ad.pageName)}`;
     const media = ad.media || [];
-    return media.map((m, i) => {
+    const items = media.map((m, i) => {
       const url = m.type === 'video' ? m.hd || m.sd || m.url : m.url;
       const suffix = media.length > 1 ? `_${i + 1}` : '';
       return { url, filename: `${base}/${ad.id}${suffix}.${BAP.extOf(url, m.type)}` };
     });
+    return only == null ? items : items.slice(only, only + 1);
+  };
+
+  /** Texto del botón de descarga: dice exactamente qué se baja. */
+  BAP.downloadLabel = function (ad) {
+    const media = ad.media || [];
+    if (!media.length) return 'Sin archivos';
+    const v = media.filter((m) => m.type === 'video').length;
+    const im = media.length - v;
+    if (media.length === 1) return v ? 'Descargar video' : 'Descargar imagen';
+    if (!im) return `Descargar ${v} videos`;
+    if (!v) return `Descargar ${im} imágenes`;
+    return `Descargar ${media.length} archivos`;
+  };
+
+  BAP.mediaItemLabel = function (ad, i) {
+    const media = ad.media || [];
+    const m = media[i];
+    const sameType = media.filter((x) => x.type === m.type);
+    const n = sameType.indexOf(m) + 1;
+    const name = m.type === 'video' ? 'Video' : 'Imagen';
+    return sameType.length > 1 ? `${name} ${n}` : name;
   };
 
   // ---------------- Íconos (trazos estilo "lucide", 24x24) ----------------

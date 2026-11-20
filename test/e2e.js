@@ -156,6 +156,21 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><title>Biblioteca
   await p.waitForTimeout(1000);
   console.log('descargas iniciadas:', await sw.evaluate(async () => (await chrome.downloads.search({})).length));
 
+  // Carrusel: botón con menú para elegir qué archivo bajar
+  const carrusel = p.locator('bap-cardbar').filter({ has: p.locator('[data-action="download-menu"]') }).first();
+  console.log('botón carrusel:', (await carrusel.locator('[data-action="download"]').textContent()).trim());
+  await carrusel.locator('[data-action="download-menu"]').click();
+  await p.waitForTimeout(300);
+  console.log('menú descarga:', (await p.locator('bap-layer .menu .mi').allTextContents()).map((t) => t.trim()));
+  await carrusel.scrollIntoViewIfNeeded();
+  await p.locator('bap-layer .menu').waitFor();
+  await p.screenshot({ path: path.join(OUT, '08-menu-descarga.png') });
+  const before = await sw.evaluate(async () => (await chrome.downloads.search({})).length);
+  await p.locator('bap-layer .menu .mi[data-i="1"]').click();
+  await p.waitForTimeout(800);
+  console.log('descargas al elegir 1 archivo:', (await sw.evaluate(async () => (await chrome.downloads.search({})).length)) - before);
+  console.log('botones de video simple:', [...new Set((await p.locator('bap-cardbar').evaluateAll((els) => els.map((e) => e.shadowRoot.querySelector('[data-action="download"]').textContent.trim()))))]);
+
   // Exportar
   const [dl] = await Promise.all([p.waitForEvent('download'), tbar.locator('[data-action="export"][data-value="xlsx"]').click()]);
   await dl.saveAs(path.join(OUT, dl.suggestedFilename()));
