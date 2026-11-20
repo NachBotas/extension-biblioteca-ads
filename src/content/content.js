@@ -1,6 +1,11 @@
 /*
- * Content script (mundo aislado): recibe los anuncios del hook, mantiene el estado
- * y dibuja el panel con filtros, orden, descarga, guardado y exportación.
+ * Content script (mundo aislado).
+ * Se integra DENTRO de la página de la Biblioteca de anuncios:
+ *  - una barra de filtros arriba de los resultados,
+ *  - botones en cada tarjeta nativa de Facebook (días, destino, guardar, descargar),
+ *  - filtros y orden aplicados sobre las mismas tarjetas,
+ *  - "Guardados" como panel lateral en la misma ventana.
+ * Si no logra reconocer las tarjetas de Facebook, ofrece una vista en grilla como respaldo.
  */
 (function () {
   if (window.__BAP_CS__) return;
@@ -10,26 +15,39 @@
   const { icon, esc } = BAP;
   const PAGE_SIZE = 60;
   const LOAD_ALL_CAP = 3000;
+  const LONG_NUM = /\d{13,20}/g;
+  const DETAILS_RE = /^(ver (los )?detalles del (anuncio|resumen)|see (ad|summary) details|ver detalhes do an[uú]ncio|ver resumo|voir les d[ée]tails|details anzeigen|anzeigendetails ansehen|vedi dettagli)/i;
 
   const state = {
     ads: new Map(),
     total: null,
     hasNext: null,
-    open: false,
     filters: BAP.defaultFilters(),
     sort: 'default',
     selected: new Set(),
     saved: {},
     folders: ['General'],
-    prefs: { lastFolder: 'General', autoLoad: true },
+    prefs: { lastFolder: 'General' },
     loading: false,
     autoLoading: false,
-    renderLimit: PAGE_SIZE,
     view: [],
+    viewIds: new Set(),
     advOpen: false,
+    mode: 'native', // 'native' | 'fallback'
+    overlayOpen: false,
+    renderLimit: PAGE_SIZE,
+    drawerOpen: false,
+    drawerFolder: '__all',
+    drawerText: '',
   };
-  const cardCache = new Map();
-  let ui = null;
+
+  const native = { cards: new Map(), grid: null, flat: new Set(), ordered: new Set() };
+  const overlayCards = new Map();
+  let css = '';
+  let sheet = null;
+  let tb = null; // barra de herramientas
+  let layer = null; // capa fija: panel lateral, menús, toasts, selección, respaldo
+  let menu = null;
 
   // ======================= Entrada de datos =======================
 
@@ -59,8 +77,10 @@
       if (payload.meta.count != null) state.total = payload.meta.count;
       if (payload.meta.hasNext != null) state.hasNext = payload.meta.hasNext;
     }
-    if (added) scheduleRender();
-    else scheduleRender(true);
+    if (added) {
+      scheduleScan();
+      scheduleRender();
+    } else scheduleRender();
   }
 
   function resetAds() {
@@ -69,7 +89,7 @@
     state.total = null;
     state.hasNext = null;
     state.renderLimit = PAGE_SIZE;
-    cardCache.clear();
+    overlayCards.clear();
     scheduleRender();
   }
 
@@ -95,14 +115,11 @@
       const prev = state.saved;
       state.saved = changes[k.saved].newValue || {};
       const ids = new Set([...Object.keys(prev), ...Object.keys(state.saved)]);
-      for (const id of ids) {
-        if ((prev[id] || {}).folder !== (state.saved[id] || {}).folder) refreshCardSaved(id);
-      }
-      scheduleRender(true);
+      for (const id of ids) if ((prev[id] || {}).folder !== (state.saved[id] || {}).folder) refreshSaved(id);
+      if (state.drawerOpen) renderDrawer();
+      scheduleRender();
     }
-    if (changes[k.folders]) {
-      state.folders = changes[k.folders].newValue || ['General'];
-    }
+    if (changes[k.folders]) state.folders = changes[k.folders].newValue || ['General'];
   });
 
   let prefsTimer = null;
@@ -133,8 +150,7 @@
     state.prefs.lastFolder = folder;
     persistPrefs();
     await BAP.storage.upsert(recs);
-    toast(ads.length > 1 ? `${ads.length} anuncios guardados en “${folder}”` : `Guardado en “${folder}”`);
-    // Miniatura durable (los links de Facebook vencen): la pide el service worker.
+    toast(ads.length > 1 ? `${ads.length} anuncios guardados en “${folder}”` : `Guardado en “${folder}”`, false, { label: 'Ver guardados', fn: () => openDrawer(true) });
     for (const rec of recs) {
       if (rec.thumbData || !rec.thumb) continue;
       chrome.runtime
@@ -158,15 +174,15 @@
     toast(items.length > 1 ? `Descargando ${items.length} archivos…` : 'Descargando…');
     try {
       const r = await chrome.runtime.sendMessage({ type: 'download', items });
-      if (r && r.failed) toast(`${r.failed} archivo(s) no se pudieron descargar`, true);
+      if (r && r.failed) toast(`${r.failed} archivo(s) no se pudieron descargar. Si el anuncio es viejo, el link venció: recargá la búsqueda.`, true);
     } catch (e) {
       toast('Error al descargar. Recargá la página e intentá de nuevo.', true);
     }
   }
 
-  function exportAds(ads, format) {
+  function exportAds(ads, format, opts = {}) {
     if (!ads.length) return toast('No hay anuncios para exportar', true);
-    BAP.exportAds(ads, format, { prefix: 'biblioteca-anuncios' });
+    BAP.exportAds(ads, format, Object.assign({ prefix: 'biblioteca-anuncios' }, opts));
     toast(`Exportados ${ads.length} anuncios a ${format === 'csv' ? 'CSV' : 'Excel'}`);
   }
 
@@ -196,11 +212,11 @@
     return fn();
   }
 
-  // La página de Facebook sigue debajo del panel: hacer scroll al final dispara su carga de más resultados.
+  // Hacer scroll al final dispara la carga de más resultados de Facebook.
   async function loadMore() {
     if (state.loading) return false;
     state.loading = true;
-    updateLoadMore();
+    updateLoadButtons();
     const before = state.ads.size;
     const h = document.documentElement.scrollHeight;
     window.scrollTo(0, Math.max(0, h - window.innerHeight - 600));
@@ -214,14 +230,14 @@
       ok = await waitFor(() => state.ads.size > before, 4000);
     }
     state.loading = false;
-    updateLoadMore();
+    updateLoadButtons();
     return ok;
   }
 
   async function loadAll() {
     if (state.autoLoading) return;
     state.autoLoading = true;
-    updateLoadMore();
+    updateLoadButtons();
     let misses = 0;
     while (state.autoLoading && state.ads.size < LOAD_ALL_CAP) {
       if (state.hasNext === false) break;
@@ -232,157 +248,232 @@
     }
     const stopped = !state.autoLoading;
     state.autoLoading = false;
-    updateLoadMore();
+    updateLoadButtons();
+    if (!state.overlayOpen && tb) tb.host.scrollIntoView({ block: 'start', behavior: 'smooth' });
     toast(stopped ? `Carga detenida · ${state.ads.size} anuncios` : `Listo · ${state.ads.size} anuncios cargados`);
   }
 
-  // ======================= UI =======================
+  // ======================= Estilos =======================
 
-  async function buildUI() {
-    if (ui) return;
-    const host = document.createElement('div');
-    host.id = 'bap-root';
-    host.style.cssText = 'all: initial;';
-    const root = host.attachShadow({ mode: 'open' });
-    let css = '';
+  const PAGE_CSS = `
+    [data-bap-hide] { display: none !important; }
+    [data-bap-flat] { display: contents !important; }
+    [data-bap-grid] {
+      display: grid !important; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)) !important;
+      gap: 16px !important; align-items: start !important;
+    }
+    [data-bap-grid] > :not([data-bap-card]):not([data-bap-flat]),
+    [data-bap-flat] > :not([data-bap-card]):not([data-bap-flat]) { grid-column: 1 / -1 !important; }
+    [data-bap-grid] > [data-bap-card], [data-bap-flat] > [data-bap-card] {
+      width: auto !important; max-width: none !important; min-width: 0 !important; margin: 0 !important; flex: none !important;
+    }
+    bap-toolbar, bap-cardbar, bap-layer { all: initial !important; display: block !important; }
+    bap-toolbar { margin: 0 0 16px !important; width: 100% !important; }
+  `;
+
+  async function loadCss() {
     try {
-      const [a, b] = await Promise.all(
-        ['src/shared/ui.css', 'src/content/panel.css'].map((p) => fetch(chrome.runtime.getURL(p)).then((r) => r.text()))
-      );
-      css = a + '\n' + b;
+      const files = ['src/shared/ui.css', 'src/content/panel.css'];
+      const texts = await Promise.all(files.map((p) => fetch(chrome.runtime.getURL(p)).then((r) => r.text())));
+      css = texts.join('\n');
     } catch (e) {
       console.warn('[BAP] css', e);
     }
-    root.innerHTML = `<style>${css}</style>
-      <div class="bap">
-        <button class="launcher" data-action="open" title="Abrir ${esc(BAP.APP_NAME)}">
-          <span class="logo">${icon('library', 17)}</span><span>${esc(BAP.APP_NAME)}</span><span class="n" data-ref="launchN">0</span>
-        </button>
-        <div class="overlay" data-ref="overlay" hidden>
-          <div class="topbar"><div class="topbar-in">
-            <div class="brand-row">
-              <div class="brand"><span class="logo">${icon('library', 17)}</span>${esc(BAP.APP_NAME)}</div>
-              <div class="stats" data-ref="stats"></div>
-              <div class="spacer"></div>
-              <label class="search">${icon('search', 15)}<input class="input" type="search" placeholder="Buscar en estos resultados…" data-ref="search"></label>
-              <button class="btn" data-action="open-saved">${icon('bookmark', 15)}Guardados <span class="filter-count" data-ref="savedN">0</span></button>
-              <button class="btn" data-action="close" title="Volver a la Biblioteca (Esc)">${icon('x', 15)}Cerrar</button>
-            </div>
+    try {
+      sheet = new CSSStyleSheet();
+      sheet.replaceSync(css);
+    } catch (e) {
+      sheet = null;
+    }
+    const st = document.createElement('style');
+    st.id = 'bap-page-css';
+    st.textContent = PAGE_CSS;
+    (document.head || document.documentElement).appendChild(st);
+  }
 
-            <div class="tb-row">
-              <button class="btn" data-action="toggle-adv" data-ref="advBtn">${icon('filter', 14)}Filtros <span class="filter-count" data-ref="filterN" hidden>0</span></button>
-              <div class="seg" data-ref="daysSeg">
-                <span class="seg-label">${icon('clock', 13)}Días activo</span>
-                <button data-action="days" data-value="0">Todos</button>
-                <button data-action="days" data-value="7">7+</button>
-                <button data-action="days" data-value="30">30+</button>
-                <button data-action="days" data-value="60">60+</button>
-                <button data-action="days" data-value="90">90+</button>
-                <input class="input input-num" type="number" min="0" placeholder="≥ días" data-ref="minDays" title="Mínimo de días activo" style="height:26px;width:72px;margin-left:2px">
-              </div>
-              <div class="seg" data-ref="sortSeg"><span class="seg-label">${icon('sort', 13)}Ordenar por</span></div>
-            </div>
+  function makeShadow(host) {
+    const root = host.attachShadow({ mode: 'open' });
+    let adopted = false;
+    if (sheet) {
+      try {
+        root.adoptedStyleSheets = [sheet];
+        adopted = true;
+      } catch (e) {
+        adopted = false;
+      }
+    }
+    if (!adopted) {
+      const st = document.createElement('style');
+      st.textContent = css;
+      root.appendChild(st);
+    }
+    return root;
+  }
 
-            <div class="tb-row">
-              <button class="chip" data-action="status-active" data-ref="activeChip">${icon('checkCircle', 13)}Solo activos</button>
-              <button class="btn btn-soft" data-action="download-all" data-ref="dlAll">${icon('download', 15)}Descargar todo</button>
-              <button class="btn" data-action="export" data-value="xlsx">${icon('sheet', 15)}Exportar Excel</button>
-              <button class="btn" data-action="export" data-value="csv">CSV</button>
-              <button class="btn btn-ghost" data-action="select-all" data-ref="selAll">Seleccionar todos</button>
-              <div class="spacer"></div>
-              <button class="btn" data-action="load-more" data-ref="loadMoreBtn">${icon('arrowDown', 15)}Cargar más</button>
-              <button class="btn btn-gold" data-action="load-all" data-ref="loadAllBtn">${icon('refresh', 15)}Cargar todos</button>
-            </div>
+  // ======================= Barra de herramientas =======================
 
-            <div class="dest-row" data-ref="destRow"></div>
-            <div class="adv" data-ref="adv" hidden></div>
-          </div></div>
-
-          <div class="content">
-            <div class="grid" data-ref="grid"></div>
-            <div class="empty" data-ref="empty" hidden></div>
-            <div class="sentinel" data-ref="sentinel"></div>
-            <div class="loadmore" data-ref="loadmore"></div>
-          </div>
+  function buildToolbar() {
+    const host = document.createElement('bap-toolbar');
+    const root = makeShadow(host);
+    const wrap = document.createElement('div');
+    wrap.className = 'bap tbar';
+    wrap.innerHTML = `
+      <div class="tb-row">
+        <div class="brand"><span class="logo">${icon('library', 16)}</span>${esc(BAP.APP_NAME)}</div>
+        <div class="stats" data-ref="stats"></div>
+        <div class="spacer"></div>
+        <label class="search">${icon('search', 15)}<input class="input" type="search" placeholder="Buscar en estos resultados…" data-ref="search"></label>
+        <button class="btn" data-action="open-drawer">${icon('bookmark', 15)}Guardados <span class="filter-count" data-ref="savedN">0</span></button>
+        <button class="btn" data-action="close-overlay" data-ref="closeBtn" hidden>${icon('x', 15)}Cerrar</button>
+      </div>
+      <div class="tb-row">
+        <button class="btn" data-action="toggle-adv" data-ref="advBtn">${icon('filter', 14)}Filtros <span class="filter-count" data-ref="filterN" hidden>0</span></button>
+        <div class="seg" data-ref="daysSeg">
+          <span class="seg-label">${icon('clock', 13)}Días activo</span>
+          <button data-action="days" data-value="0">Todos</button>
+          <button data-action="days" data-value="7">7+</button>
+          <button data-action="days" data-value="30">30+</button>
+          <button data-action="days" data-value="60">60+</button>
+          <button data-action="days" data-value="90">90+</button>
+          <input class="input input-num" type="number" min="0" placeholder="≥ días" data-ref="minDays" title="Mínimo de días activo">
         </div>
-        <div class="selbar" data-ref="selbar" hidden></div>
-        <div class="toasts" data-ref="toasts"></div>
-      </div>`;
-    document.documentElement.appendChild(host);
-
-    const refs = {};
+        <div class="seg" data-ref="sortSeg"><span class="seg-label">${icon('sort', 13)}Ordenar por</span>
+          ${BAP.SORTS.map((s) => `<button data-action="sort" data-value="${s.key}" ${s.key === 'reach' ? 'data-reach="1" hidden' : ''}>${esc({ default: 'Facebook', days_desc: 'Más días', days_asc: 'Menos días' }[s.key] || s.label)}</button>`).join('')}
+        </div>
+      </div>
+      <div class="tb-row">
+        <button class="chip" data-action="status-active" data-ref="activeChip">${icon('checkCircle', 13)}Solo activos</button>
+        <button class="btn btn-soft" data-action="download-all" data-ref="dlAll">${icon('download', 15)}Descargar todo</button>
+        <button class="btn" data-action="export" data-value="xlsx">${icon('sheet', 15)}Exportar Excel</button>
+        <button class="btn" data-action="export" data-value="csv">CSV</button>
+        <button class="btn btn-ghost" data-action="select-all" data-ref="selAll">Seleccionar todos</button>
+        <div class="spacer"></div>
+        <button class="btn btn-gold" data-action="load-all" data-ref="loadAllBtn">${icon('refresh', 15)}Cargar todos</button>
+      </div>
+      <div class="dest-row" data-ref="destRow"></div>
+      <div class="adv" data-ref="adv" hidden></div>`;
+    root.appendChild(wrap);
+    const refs = { host, root };
     root.querySelectorAll('[data-ref]').forEach((n) => (refs[n.dataset.ref] = n));
-    ui = { host, root, ...refs };
 
-    // Orden
-    ui.sortSeg.insertAdjacentHTML(
-      'beforeend',
-      BAP.SORTS.map((s) => `<button data-action="sort" data-value="${s.key}" ${s.key === 'reach' ? 'data-reach="1" hidden' : ''}>${esc(s.key === 'default' ? 'Facebook' : s.label.replace('Más días activo', 'Más días').replace('Menos días activo', 'Menos días'))}</button>`).join('')
+    root.addEventListener('click', (e) => {
+      e.stopPropagation();
+      onToolbarClick(e);
+    });
+    root.addEventListener('change', onToolbarChange);
+    refs.search.addEventListener(
+      'input',
+      debounce(() => {
+        state.filters.text = refs.search.value.trim();
+        afterFilterChange(false);
+      }, 200)
     );
-
-    root.addEventListener('click', onClick);
-    ui.search.addEventListener('input', debounce(() => {
-      state.filters.text = ui.search.value.trim();
-      state.renderLimit = PAGE_SIZE;
-      render();
-    }, 200));
-    ui.minDays.addEventListener('change', () => {
-      state.filters.minDays = Math.max(0, Number(ui.minDays.value) || 0);
+    refs.minDays.addEventListener('change', () => {
+      state.filters.minDays = Math.max(0, Number(refs.minDays.value) || 0);
       afterFilterChange();
     });
-    root.addEventListener('change', onChange);
-    root.addEventListener('input', onInput);
-    window.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape' && state.open) {
-        if (ui.menu) closeMenu();
-        else setOpen(false);
+    // Evita que los atajos de teclado de Facebook capturen lo que se escribe.
+    ['keydown', 'keyup', 'keypress'].forEach((t) => root.addEventListener(t, stopKeys));
+
+    // Pastilla flotante "Filtros" cuando la barra queda fuera de la vista.
+    new IntersectionObserver((entries) => {
+      const visible = entries.some((e) => e.isIntersecting);
+      if (layer) layer.pill.hidden = visible || state.mode !== 'native' || !native.cards.size || !host.isConnected || state.overlayOpen;
+    }).observe(host);
+    return refs;
+  }
+
+  function onToolbarChange(e) {
+    const t = e.target;
+    const key = t.dataset && t.dataset.filter;
+    if (!key) return;
+    if (key === 'maxDays') state.filters.maxDays = t.value === '' ? null : Math.max(0, Number(t.value));
+    else if (key === 'minCopies') state.filters.minCopies = Math.max(1, Number(t.value) || 1);
+    else state.filters[key] = t.value;
+    afterFilterChange();
+  }
+
+  function onToolbarClick(e) {
+    const btn = e.target.closest('[data-action]');
+    closeMenu();
+    if (!btn) return;
+    const action = btn.dataset.action;
+    const value = btn.dataset.value;
+    const f = state.filters;
+    switch (action) {
+      case 'open-drawer':
+        return openDrawer(true);
+      case 'close-overlay':
+        return setOverlay(false);
+      case 'toggle-adv':
+        state.advOpen = !state.advOpen;
+        tb.adv.hidden = !state.advOpen;
+        if (state.advOpen) renderAdvanced();
+        return updateToolbar();
+      case 'dest':
+        f.dest = f.dest === value && value !== 'all' ? 'all' : value;
+        if (f.dest !== 'message' && f.dest !== 'all') f.channel = 'all';
+        return afterFilterChange();
+      case 'days':
+        f.minDays = Number(value);
+        tb.minDays.value = '';
+        return afterFilterChange();
+      case 'sort':
+        state.sort = value;
+        return afterFilterChange();
+      case 'status-active':
+        f.status = f.status === 'active' ? 'all' : 'active';
+        return afterFilterChange();
+      case 'media':
+      case 'platform':
+      case 'status':
+        f[action] = value;
+        return afterFilterChange();
+      case 'savedOnly':
+        f.savedOnly = value === 'true';
+        return afterFilterChange();
+      case 'reset-filters':
+        state.filters = BAP.defaultFilters();
+        tb.search.value = '';
+        return afterFilterChange();
+      case 'load-all':
+        return loadAll();
+      case 'stop-load':
+        state.autoLoading = false;
+        return updateLoadButtons();
+      case 'download-all':
+        return downloadAds(state.view);
+      case 'export':
+        return exportAds(state.view, value);
+      case 'select-all': {
+        const allSel = state.view.length > 0 && state.view.every((a) => state.selected.has(a.id));
+        state.view.forEach((a) => (allSel ? state.selected.delete(a.id) : state.selected.add(a.id)));
+        return render();
       }
-    });
-    ui.overlay.addEventListener('scroll', () => closeMenu(), { passive: true });
-
-    new IntersectionObserver(
-      (entries) => {
-        if (!entries.some((e) => e.isIntersecting) || !state.open) return;
-        if (state.renderLimit < state.view.length) {
-          state.renderLimit += PAGE_SIZE;
-          renderGrid();
-        } else if (state.prefs.autoLoad !== false && state.hasNext !== false && !state.loading && !state.autoLoading && state.ads.size) {
-          loadMore();
-        }
-      },
-      { root: ui.overlay, rootMargin: '600px' }
-    ).observe(ui.sentinel);
-
-    render();
-  }
-
-  function setOpen(open) {
-    state.open = open;
-    ui.overlay.hidden = !open;
-    ui.root.querySelector('.launcher').hidden = open;
-    if (!open) {
-      closeMenu();
-      ui.overlay.querySelectorAll('video').forEach((v) => v.pause());
-    } else {
-      render();
     }
-    updateSelbar();
   }
 
-  // ---------- Render ----------
+  function afterFilterChange(scrollTop = true) {
+    state.renderLimit = PAGE_SIZE;
+    persistPrefs();
+    render();
+    if (!scrollTop) return;
+    if (state.overlayOpen) layer.overlay.scrollTo({ top: 0 });
+    else if (tb && tb.host.isConnected) {
+      const r = tb.host.getBoundingClientRect();
+      if (r.top < 0) tb.host.scrollIntoView({ block: 'start' });
+    }
+  }
+
+  // ======================= Render =======================
+
   let renderQueued = false;
-  let lightOnly = true;
-  function scheduleRender(light) {
-    if (!light) lightOnly = false;
+  function scheduleRender() {
     if (renderQueued) return;
     renderQueued = true;
     requestAnimationFrame(() => {
       renderQueued = false;
-      const l = lightOnly;
-      lightOnly = true;
-      if (!ui) return;
-      if (l) renderChrome();
-      else render();
+      render();
     });
   }
 
@@ -397,37 +488,31 @@
     const list = [];
     for (const ad of state.ads.values()) if (BAP.matches(ad, state.filters, state.saved)) list.push(ad);
     state.view = BAP.sortAds(list, state.sort);
+    state.viewIds = new Set(state.view.map((a) => a.id));
   }
 
   function render() {
-    if (!ui) return;
+    if (!tb) return;
     computeView();
-    renderChrome();
-    if (state.open) renderGrid();
-  }
-
-  function renderChrome() {
-    updateLauncher();
-    if (!state.open) return;
     updateStats();
     updateToolbar();
     updateDestChips();
     if (state.advOpen) renderAdvanced();
-    updateLoadMore();
+    updateLoadButtons();
     updateSelbar();
-  }
-
-  function updateLauncher() {
-    ui.launchN.textContent = state.ads.size ? `${state.ads.size} anuncios` : 'Abrir';
-    ui.savedN.textContent = Object.keys(state.saved).length;
+    applyNative();
+    if (state.overlayOpen) renderOverlayGrid();
+    updateFallback();
   }
 
   function updateStats() {
     const parts = [];
-    if (state.total != null) parts.push(`<span>~<b>${BAP.fmtNum(state.total)}</b> resultados en la búsqueda</span>`);
+    if (state.total != null) parts.push(`<span>~<b>${BAP.fmtNum(state.total)}</b> resultados</span>`);
     parts.push(`<span><b>${state.ads.size}</b> cargados</span>`);
-    parts.push(`<span><b>${state.view.length}</b> con estos filtros</span>`);
-    ui.stats.innerHTML = parts.join('<span class="dot"></span>');
+    parts.push(`<span><b>${state.view.length}</b> visibles con filtros</span>`);
+    tb.stats.innerHTML = parts.join('<span class="dot"></span>');
+    tb.savedN.textContent = Object.keys(state.saved).length;
+    if (layer) layer.pill.querySelector('[data-ref="pillN"]').textContent = state.view.length;
   }
 
   function activeFilterCount() {
@@ -443,25 +528,22 @@
 
   function updateToolbar() {
     const f = state.filters;
-    ui.daysSeg.querySelectorAll('button').forEach((b) => b.classList.toggle('on', Number(b.dataset.value) === Number(f.minDays)));
-    if (document.activeElement !== ui.host || ui.root.activeElement !== ui.minDays) {
-      ui.minDays.value = [0, 7, 30, 60, 90].includes(Number(f.minDays)) ? '' : f.minDays || '';
-    }
-    ui.sortSeg.querySelectorAll('button').forEach((b) => b.classList.toggle('on', b.dataset.value === state.sort));
-    const hasReach = [...state.ads.values()].some((a) => a.reach != null);
-    const rb = ui.sortSeg.querySelector('[data-reach]');
-    if (rb) rb.hidden = !hasReach;
-    ui.activeChip.classList.toggle('on', f.status === 'active');
+    tb.daysSeg.querySelectorAll('button').forEach((b) => b.classList.toggle('on', Number(b.dataset.value) === Number(f.minDays)));
+    if (tb.root.activeElement !== tb.minDays) tb.minDays.value = [0, 7, 30, 60, 90].includes(Number(f.minDays)) ? '' : f.minDays || '';
+    tb.sortSeg.querySelectorAll('button').forEach((b) => b.classList.toggle('on', b.dataset.value === state.sort));
+    const rb = tb.sortSeg.querySelector('[data-reach]');
+    if (rb) rb.hidden = ![...state.ads.values()].some((a) => a.reach != null);
+    tb.activeChip.classList.toggle('on', f.status === 'active');
     const n = activeFilterCount();
-    ui.filterN.hidden = !n;
-    ui.filterN.textContent = n;
-    ui.advBtn.classList.toggle('active-filter', state.advOpen || n > 0);
+    tb.filterN.hidden = !n;
+    tb.filterN.textContent = n;
+    tb.advBtn.classList.toggle('active-filter', state.advOpen || n > 0);
     const files = state.view.reduce((s, a) => s + (a.media || []).length, 0);
-    ui.dlAll.innerHTML = `${icon('download', 15)}Descargar todo <span class="filter-count">${files}</span>`;
-    ui.dlAll.disabled = !files;
+    tb.dlAll.innerHTML = `${icon('download', 15)}Descargar todo <span class="filter-count">${files}</span>`;
+    tb.dlAll.disabled = !files;
     const allSel = state.view.length > 0 && state.view.every((a) => state.selected.has(a.id));
-    ui.selAll.textContent = allSel ? 'Quitar selección' : 'Seleccionar todos';
-    if (ui.search.value !== state.filters.text && ui.root.activeElement !== ui.search) ui.search.value = state.filters.text;
+    tb.selAll.textContent = allSel ? 'Quitar selección' : 'Seleccionar todos';
+    if (tb.root.activeElement !== tb.search && tb.search.value !== f.text) tb.search.value = f.text;
   }
 
   function updateDestChips() {
@@ -471,10 +553,7 @@
     const f = state.filters;
     const chip = (key, label, ic) =>
       `<button class="chip ${f.dest === key ? 'on' : ''} ${!counts[key] && key !== 'all' ? 'zero' : ''}" data-action="dest" data-value="${key}">${ic ? icon(ic, 14) : ''}${esc(label)}<span class="count">${counts[key] || 0}</span></button>`;
-    ui.destRow.innerHTML =
-      `<span class="lbl">Destino del botón</span>` +
-      chip('all', 'Todos', 'grid') +
-      BAP.DESTINATIONS.map((d) => chip(d.key, d.label, d.icon)).join('');
+    tb.destRow.innerHTML = `<span class="lbl">Destino del botón</span>` + chip('all', 'Todos', 'grid') + BAP.DESTINATIONS.map((d) => chip(d.key, d.label, d.icon)).join('');
   }
 
   function optionCounts(list, getter) {
@@ -494,13 +573,11 @@
     const mediaCounts = Object.fromEntries(optionCounts(filteredExcept('media'), (a) => a.mediaType));
     const platCounts = new Map();
     for (const a of filteredExcept('platform')) for (const p of a.platforms || []) platCounts.set(p, (platCounts.get(p) || 0) + 1);
-
     const chips = (action, items, cur) =>
       `<div class="chips">${items
         .map(([v, label, n]) => `<button class="chip ${cur === v ? 'on' : ''}" data-action="${action}" data-value="${esc(v)}">${esc(label)}${n != null ? `<span class="count">${n}</span>` : ''}</button>`)
         .join('')}</div>`;
-
-    ui.adv.innerHTML = `
+    tb.adv.innerHTML = `
       <label class="field"><span>Texto del botón (CTA)</span>
         <select class="select" data-filter="cta">
           <option value="all">Todos los botones</option>
@@ -521,192 +598,413 @@
       <button class="btn btn-ghost" data-action="reset-filters">${icon('x', 14)}Restablecer filtros</button>`;
   }
 
-  function updateLoadMore() {
-    if (!ui) return;
-    const busy = state.loading || state.autoLoading;
-    ui.loadMoreBtn.disabled = busy;
-    ui.loadMoreBtn.innerHTML = state.loading && !state.autoLoading ? `<span class="spinner"></span>Cargando…` : `${icon('arrowDown', 15)}Cargar más`;
-    ui.loadAllBtn.dataset.action = state.autoLoading ? 'stop-load' : 'load-all';
-    ui.loadAllBtn.innerHTML = state.autoLoading ? `${icon('stop', 14)}Detener (${state.ads.size})` : `${icon('refresh', 15)}Cargar todos`;
-
-    let html = '';
-    if (state.renderLimit < state.view.length) {
-      html = `<button class="btn" data-action="show-more">Mostrar ${Math.min(PAGE_SIZE, state.view.length - state.renderLimit)} más</button>`;
-    } else if (state.ads.size && state.hasNext !== false) {
-      html = busy
-        ? `<span class="btn" style="pointer-events:none"><span class="spinner"></span>Cargando más anuncios de Facebook…</span>`
-        : `<button class="btn" data-action="load-more">${icon('arrowDown', 15)}Cargar más de Facebook</button>`;
-    } else if (state.ads.size && state.hasNext === false) {
-      html = `<div class="hint">No hay más resultados para esta búsqueda.</div>`;
-    }
-    ui.loadmore.innerHTML = html;
+  function updateLoadButtons() {
+    if (!tb) return;
+    tb.loadAllBtn.dataset.action = state.autoLoading ? 'stop-load' : 'load-all';
+    tb.loadAllBtn.innerHTML = state.autoLoading ? `${icon('stop', 14)}Detener (${state.ads.size})` : `${icon('refresh', 15)}Cargar todos`;
+    tb.loadAllBtn.disabled = !state.autoLoading && state.hasNext === false;
+    tb.loadAllBtn.title = state.hasNext === false ? 'Ya están cargados todos los resultados' : 'Carga todos los resultados de la búsqueda';
+    if (state.overlayOpen) renderOverlayLoadMore();
   }
 
-  function updateSelbar() {
-    const n = state.selected.size;
-    ui.selbar.hidden = !state.open || !n;
-    if (!n) return;
-    ui.selbar.innerHTML = `<span>${n} seleccionado${n > 1 ? 's' : ''}</span>
-      <button class="btn btn-primary" data-action="sel-download">${icon('download', 14)}Descargar</button>
-      <button class="btn" data-action="sel-save">${icon('bookmark', 14)}Guardar</button>
-      <button class="btn" data-action="sel-export">${icon('sheet', 14)}Excel</button>
-      <button class="btn" data-action="sel-copy">${icon('link', 14)}Copiar links</button>
-      <button class="btn" data-action="sel-clear" title="Quitar selección">${icon('x', 14)}</button>`;
+  // ======================= Integración con las tarjetas de Facebook =======================
+
+  let scanTimer = null;
+  function scheduleScan(delay = 250) {
+    clearTimeout(scanTimer);
+    scanTimer = setTimeout(scan, delay);
   }
 
-  function emptyHtml() {
-    if (!state.ads.size) {
-      return `${icon('search', 40)}<h3>Todavía no hay anuncios cargados</h3>
-        <p>Hacé una búsqueda en la Biblioteca de anuncios (o recargá la página) y los resultados van a aparecer acá automáticamente.</p>
-        <p style="margin-top:14px"><button class="btn btn-primary" data-action="close">Ir a la búsqueda</button></p>`;
-    }
-    return `${icon('filter', 40)}<h3>Ningún anuncio coincide con los filtros</h3>
-      <p>Hay ${state.ads.size} anuncios cargados. Probá quitar algún filtro o cargá más resultados.</p>
-      <p style="margin-top:14px"><button class="btn" data-action="reset-filters">Restablecer filtros</button></p>`;
+  function distinctLongNumbers(text) {
+    const m = text.match(LONG_NUM);
+    return m ? new Set(m).size : 0;
   }
 
-  function getCard(ad) {
-    let el = cardCache.get(ad.id);
-    if (!el) {
-      el = BAP.renderCard(ad, { mode: 'live', savedFolder: (state.saved[ad.id] || {}).folder || null, selected: state.selected.has(ad.id) });
-      cardCache.set(ad.id, el);
-    }
-    el.classList.toggle('selected', state.selected.has(ad.id));
+  function blockAncestor(el) {
+    while (el && el.parentElement && getComputedStyle(el).display.startsWith('inline')) el = el.parentElement;
     return el;
   }
 
-  function renderGrid() {
-    const list = state.view.slice(0, state.renderLimit);
-    ui.empty.hidden = list.length > 0;
-    if (!list.length) ui.empty.innerHTML = emptyHtml();
-    const grid = ui.grid;
-    const current = [...grid.children];
-    const same = current.length === list.length && current.every((n, i) => n.dataset.id === list[i].id);
-    if (same) {
-      list.forEach((ad) => getCard(ad));
+  // Sube desde el texto "Identificador de la biblioteca: …" hasta la caja que es la tarjeta completa.
+  function cardRootFor(textNode) {
+    let el = blockAncestor(textNode.parentElement);
+    if (!el) return null;
+    let w = el.getBoundingClientRect().width;
+    while (el.parentElement && el.parentElement !== document.body && el.parentElement !== document.documentElement) {
+      const p = el.parentElement;
+      const pw = p.getBoundingClientRect().width;
+      if (w > 0 && pw > w * 1.8) break;
+      if (distinctLongNumbers(p.textContent || '') > 1) break;
+      el = p;
+      w = pw;
+    }
+    return el;
+  }
+
+  function findDetailsButton(root) {
+    const cands = root.querySelectorAll('div, a, span, [role="button"]');
+    for (const el of cands) {
+      const t = (el.textContent || '').trim();
+      if (t.length > 40 || !DETAILS_RE.test(t)) continue;
+      // El contenedor más externo que solo tiene ese botón.
+      let target = el;
+      while (target.parentElement && target.parentElement !== root) {
+        const p = target.parentElement;
+        const cs = getComputedStyle(p);
+        const isRow = cs.display.includes('flex') && !cs.flexDirection.startsWith('column');
+        if ((p.textContent || '').trim() === t || isRow) target = p;
+        else break;
+      }
+      return target;
+    }
+    return null;
+  }
+
+  function scan() {
+    if (!state.ads.size || !document.body) return;
+    // Limpia tarjetas que Facebook quitó de la página.
+    for (const [id, c] of native.cards) if (!c.root.isConnected || !c.host.isConnected) native.cards.delete(id);
+
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+      acceptNode(n) {
+        if (n.nodeType === 1) {
+          const name = n.localName;
+          if (n.hasAttribute('data-bap-card') || name.startsWith('bap-') || name === 'script' || name === 'style' || name === 'noscript' || n.getAttribute('role') === 'dialog') {
+            return NodeFilter.FILTER_REJECT;
+          }
+          return NodeFilter.FILTER_SKIP;
+        }
+        return LONG_NUM.test(n.data) ? ((LONG_NUM.lastIndex = 0), NodeFilter.FILTER_ACCEPT) : ((LONG_NUM.lastIndex = 0), NodeFilter.FILTER_SKIP);
+      },
+    });
+    const found = [];
+    let n;
+    while ((n = walker.nextNode())) {
+      const ids = (n.data.match(LONG_NUM) || []).filter((x) => state.ads.has(x));
+      if (ids.length === 1 && !native.cards.has(ids[0])) found.push([ids[0], n]);
+    }
+    for (const [id, textNode] of found) {
+      if (native.cards.has(id) || !textNode.isConnected) continue;
+      const root = cardRootFor(textNode);
+      if (!root || root.closest('[data-bap-card]') || root.querySelector('[data-bap-card]')) continue;
+      root.setAttribute('data-bap-card', id);
+      const host = buildCardBar(state.ads.get(id), root);
+      native.cards.set(id, { root, host });
+    }
+    if (native.cards.size) placeToolbar();
+    if (found.length) applyNative();
+    updateFallback();
+  }
+
+  // ---------- Barra dentro de cada tarjeta ----------
+  function cardBarHtml(ad) {
+    const dest = BAP.destByKey[ad.dest] || BAP.destByKey.other;
+    const destTitle = ad.channel && ad.channel !== dest.label ? `${dest.label} · ${ad.channel}` : dest.label;
+    const sv = state.saved[ad.id];
+    const n = (ad.media || []).length;
+    const dl = !n ? 'Sin archivos' : n > 1 ? `Descargar (${n})` : ad.media[0].type === 'video' ? 'Descargar video' : 'Descargar imagen';
+    return `
+      <div class="nb-kpis">
+        <span class="days ${BAP.daysTone(ad.days)}" title="Días en circulación">${icon(ad.days >= 30 ? 'flame' : 'clock', 14)}${BAP.fmtDays(ad.days)}</span>
+        <span class="dest tone-${dest.tone}" title="${esc(destTitle)}${ad.ctaText ? ' · Botón: ' + esc(ad.ctaText) : ''}">${icon(dest.icon, 13)}<span class="lbl">${esc(destTitle)}</span></span>
+        ${ad.copies > 1 ? `<span class="versions" title="Anuncios con este mismo creativo">${icon('layers', 13)}<b>${ad.copies}</b></span>` : ''}
+        <span class="spacer"></span>
+        <button class="icon-btn" data-action="more" title="Más opciones">${icon('dots', 18)}</button>
+      </div>
+      <div class="act-row">
+        <button class="check" data-action="select" title="Seleccionar"><span class="box">${icon('check', 12)}</span></button>
+        <div class="split">
+          <button class="btn ${sv ? 'saved' : 'btn-soft'}" data-action="save" title="${sv ? 'Quitar de guardados' : 'Guardar para ver después'}">${icon(sv ? 'bookmarkFill' : 'bookmark', 15)}<span>${sv ? `Guardado · ${esc(sv.folder)}` : 'Guardar'}</span></button>
+          <button class="btn ${sv ? 'saved' : 'btn-soft'}" data-action="save-menu" title="Elegir carpeta">${icon('chevronDown', 15)}</button>
+        </div>
+      </div>
+      <button class="btn btn-primary btn-lg btn-block" data-action="download" ${n ? '' : 'disabled'}>${icon('download', 16)}${dl}</button>`;
+  }
+
+  function buildCardBar(ad, root) {
+    const host = document.createElement('bap-cardbar');
+    host.dataset.id = ad.id;
+    const sr = makeShadow(host);
+    const wrap = document.createElement('div');
+    wrap.className = 'bap nb';
+    wrap.innerHTML = cardBarHtml(ad);
+    sr.appendChild(wrap);
+    sr.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const btn = e.target.closest('[data-action]');
+      if (!btn) return;
+      const cur = state.ads.get(host.dataset.id);
+      if (cur) cardAction(btn.dataset.action, cur, btn);
+    });
+    const details = findDetailsButton(root);
+    if (details && details.parentElement) {
+      details.parentElement.insertBefore(host, details);
     } else {
-      // Reutiliza nodos ya montados en su lugar para no cortar videos en reproducción.
-      const wanted = new Set(list.map((a) => a.id));
-      current.forEach((n) => !wanted.has(n.dataset.id) && n.remove());
-      let ref = grid.firstElementChild;
-      for (const ad of list) {
-        const el = getCard(ad);
-        if (el === ref) {
-          ref = ref.nextElementSibling;
-        } else {
-          grid.insertBefore(el, ref);
+      wrap.classList.add('nb-top');
+      root.insertBefore(host, root.firstChild);
+    }
+    host.classList.toggle('sel', state.selected.has(ad.id));
+    wrap.classList.toggle('selected', state.selected.has(ad.id));
+    return host;
+  }
+
+  function refreshSaved(id) {
+    const ad = state.ads.get(id);
+    if (!ad) return;
+    const c = native.cards.get(id);
+    if (c) {
+      const wrap = c.host.shadowRoot.querySelector('.nb');
+      wrap.innerHTML = cardBarHtml(ad);
+    }
+    const el = overlayCards.get(id);
+    if (el) {
+      const fresh = BAP.renderCard(ad, { mode: 'live', savedFolder: (state.saved[id] || {}).folder || null });
+      el.querySelector('.split').replaceWith(fresh.querySelector('.split'));
+    }
+  }
+
+  function setSelectedUI(id) {
+    const on = state.selected.has(id);
+    const c = native.cards.get(id);
+    if (c) c.host.shadowRoot.querySelector('.nb').classList.toggle('selected', on);
+    const el = overlayCards.get(id);
+    if (el) el.classList.toggle('selected', on);
+  }
+
+  // ---------- Filtros y orden sobre las tarjetas de Facebook ----------
+  function setAttr(el, name, on) {
+    if (on && !el.hasAttribute(name)) el.setAttribute(name, '');
+    else if (!on && el.hasAttribute(name)) el.removeAttribute(name);
+  }
+
+  function lca(nodes) {
+    let a = nodes[0].parentElement;
+    while (a && !nodes.every((n) => a.contains(n))) a = a.parentElement;
+    return a;
+  }
+
+  function applyNative() {
+    if (!native.cards.size) return;
+    const sorting = state.sort !== 'default';
+    const order = sorting ? new Map(state.view.map((a, i) => [a.id, i])) : null;
+    for (const [id, c] of native.cards) {
+      if (!c.root.isConnected) {
+        native.cards.delete(id);
+        continue;
+      }
+      setAttr(c.root, 'data-bap-hide', !state.viewIds.has(id));
+      setSelectedUI(id);
+      if (sorting) c.root.style.setProperty('order', String(order.has(id) ? order.get(id) : 99999));
+      else if (c.root.style.order) c.root.style.removeProperty('order');
+    }
+    if (sorting) flatten();
+    else unflatten();
+  }
+
+  // Para ordenar entre los distintos bloques que arma Facebook, aplanamos los contenedores intermedios
+  // (display: contents) y convertimos el contenedor común en una grilla. No movemos nodos de Facebook.
+  function flatten() {
+    const roots = [...native.cards.values()].map((c) => c.root).filter((r) => r.isConnected);
+    if (roots.length < 2) return unflatten();
+    const common = lca(roots);
+    if (!common || common === document.body) return unflatten();
+    const flat = new Set();
+    for (const r of roots) {
+      let p = r.parentElement;
+      while (p && p !== common) {
+        flat.add(p);
+        p = p.parentElement;
+      }
+    }
+    for (const el of native.flat) if (!flat.has(el)) el.removeAttribute('data-bap-flat');
+    for (const el of flat) setAttr(el, 'data-bap-flat', true);
+    if (native.grid && native.grid !== common) native.grid.removeAttribute('data-bap-grid');
+    setAttr(common, 'data-bap-grid', true);
+    native.grid = common;
+    native.flat = flat;
+
+    // Lo que no es tarjeta (encabezados, "cargando…") va arriba o abajo de la grilla.
+    let first = roots[0];
+    for (const r of roots) if (r.compareDocumentPosition(first) & Node.DOCUMENT_POSITION_FOLLOWING) first = r;
+    const others = [...common.children, ...[...flat].flatMap((f) => [...f.children])].filter((el) => !el.hasAttribute('data-bap-card') && !el.hasAttribute('data-bap-flat'));
+    for (const el of others) {
+      const before = el.compareDocumentPosition(first) & Node.DOCUMENT_POSITION_FOLLOWING;
+      el.style.setProperty('order', before ? '-1' : '1000000');
+      native.ordered.add(el);
+    }
+  }
+
+  function unflatten() {
+    for (const el of native.flat) el.removeAttribute('data-bap-flat');
+    native.flat = new Set();
+    if (native.grid) native.grid.removeAttribute('data-bap-grid');
+    native.grid = null;
+    for (const el of native.ordered) el.style.removeProperty('order');
+    native.ordered = new Set();
+  }
+
+  function placeToolbar() {
+    if (!tb || state.overlayOpen) return;
+    const roots = [...native.cards.values()].map((c) => c.root).filter((r) => r.isConnected);
+    if (!roots.length) return;
+    const anchor = native.grid || (roots.length > 1 ? lca(roots) : roots[0].parentElement);
+    if (!anchor || !anchor.parentElement || anchor === document.body) return;
+    if (tb.host.nextElementSibling !== anchor || tb.host.parentElement !== anchor.parentElement) {
+      anchor.parentElement.insertBefore(tb.host, anchor);
+    }
+    tb.closeBtn.hidden = true;
+  }
+
+  // ---------- Observador de cambios de Facebook ----------
+  function observePage() {
+    const mo = new MutationObserver((muts) => {
+      for (const m of muts) {
+        for (const node of m.addedNodes) {
+          if (node.nodeType === 1 && !node.localName.startsWith('bap-')) return scheduleScan(300);
+        }
+        for (const node of m.removedNodes) {
+          if (node.nodeType === 1 && !node.localName.startsWith('bap-')) return scheduleScan(300);
         }
       }
+    });
+    mo.observe(document.body, { childList: true, subtree: true });
+  }
+
+  // ======================= Acciones de anuncio =======================
+
+  function cardAction(action, ad, anchor) {
+    switch (action) {
+      case 'select':
+        if (state.selected.has(ad.id)) state.selected.delete(ad.id);
+        else state.selected.add(ad.id);
+        setSelectedUI(ad.id);
+        updateSelbar();
+        updateToolbar();
+        return;
+      case 'save':
+        if (state.saved[ad.id]) return unsave([ad.id]);
+        return saveAds([ad]);
+      case 'save-menu':
+        return openFolderMenu(anchor, ad, (folder) => saveAds([ad], folder));
+      case 'download':
+        return downloadAds([ad]);
+      case 'more':
+        return openMoreMenu(anchor, ad);
     }
-    updateLoadMore();
   }
 
-  function refreshCardSaved(id) {
-    const el = cardCache.get(id);
-    const ad = state.ads.get(id);
-    if (!el || !ad) return;
-    const fresh = BAP.renderCard(ad, { mode: 'live', savedFolder: (state.saved[id] || {}).folder || null });
-    el.querySelector('.split').replaceWith(fresh.querySelector('.split'));
+  function selectedAds() {
+    return [...state.selected].map((id) => state.ads.get(id)).filter(Boolean);
   }
 
-  // ---------- Eventos ----------
+  // ======================= Capa fija (panel lateral, menús, toasts) =======================
 
-  function afterFilterChange() {
-    state.renderLimit = PAGE_SIZE;
-    persistPrefs();
-    render();
-    ui.overlay.scrollTo({ top: 0 });
+  function buildLayer() {
+    const host = document.createElement('bap-layer');
+    const root = makeShadow(host);
+    const wrap = document.createElement('div');
+    wrap.className = 'bap';
+    wrap.innerHTML = `
+      <button class="pill" data-action="to-toolbar" data-ref="pill" hidden>${icon('filter', 15)}Filtros · <span data-ref="pillN">0</span> visibles</button>
+      <button class="launcher" data-action="open-overlay" data-ref="launcher" hidden title="Ver los anuncios en grilla">
+        <span class="logo">${icon('library', 17)}</span><span>${esc(BAP.APP_NAME)}</span><span class="n" data-ref="launchN">0</span>
+      </button>
+      <div class="overlay" data-ref="overlay" hidden>
+        <div class="overlay-top" data-ref="overlayTop"></div>
+        <div class="content">
+          <div class="grid" data-ref="grid"></div>
+          <div class="empty" data-ref="empty" hidden></div>
+          <div class="sentinel" data-ref="sentinel"></div>
+          <div class="loadmore" data-ref="loadmore"></div>
+        </div>
+      </div>
+      <div class="scrim" data-action="close-drawer" data-ref="scrim" hidden></div>
+      <aside class="drawer" data-ref="drawer" hidden aria-label="Anuncios guardados">
+        <div class="drawer-h">
+          <div class="brand">${icon('bookmark', 17)}Guardados <span class="filter-count" data-ref="drawerN">0</span></div>
+          <div class="spacer"></div>
+          <button class="icon-btn" data-action="close-drawer" title="Cerrar (Esc)">${icon('x', 18)}</button>
+        </div>
+        <div class="drawer-tools">
+          <label class="search">${icon('search', 15)}<input class="input" type="search" placeholder="Buscar en guardados…" data-ref="drawerSearch"></label>
+          <div class="chips" data-ref="drawerFolders"></div>
+        </div>
+        <div class="drawer-list" data-ref="drawerList"></div>
+        <div class="drawer-f">
+          <button class="btn" data-action="drawer-export" data-value="xlsx">${icon('sheet', 15)}Exportar Excel</button>
+          <button class="btn" data-action="drawer-export" data-value="csv">CSV</button>
+          <button class="btn" data-action="drawer-copy">${icon('link', 15)}Copiar links</button>
+          <div class="spacer"></div>
+          <button class="btn btn-ghost" data-action="open-saved-page" title="Abre la página completa de guardados en otra pestaña">${icon('external', 14)}Página completa</button>
+        </div>
+      </aside>
+      <div class="selbar" data-ref="selbar" hidden></div>
+      <div class="toasts" data-ref="toasts"></div>`;
+    root.appendChild(wrap);
+    const refs = { host, root, wrap };
+    root.querySelectorAll('[data-ref]').forEach((n) => (refs[n.dataset.ref] = n));
+    document.documentElement.appendChild(host);
+
+    root.addEventListener('click', onLayerClick);
+    ['keydown', 'keyup', 'keypress'].forEach((t) => root.addEventListener(t, stopKeys));
+    refs.drawerSearch.addEventListener(
+      'input',
+      debounce(() => {
+        state.drawerText = refs.drawerSearch.value.trim();
+        renderDrawer();
+      }, 150)
+    );
+    refs.drawerList.addEventListener('input', (e) => {
+      const t = e.target;
+      if (t.dataset.role !== 'note') return;
+      const id = t.closest('[data-id]').dataset.id;
+      clearTimeout(t._timer);
+      t._timer = setTimeout(() => BAP.storage.patch(id, { note: t.value }), 500);
+    });
+    refs.overlay.addEventListener('scroll', () => closeMenu(), { passive: true });
+    window.addEventListener('scroll', () => closeMenu(), { passive: true });
+
+    new IntersectionObserver(
+      (entries) => {
+        if (!entries.some((e) => e.isIntersecting) || !state.overlayOpen) return;
+        if (state.renderLimit < state.view.length) {
+          state.renderLimit += PAGE_SIZE;
+          renderOverlayGrid();
+        } else if (state.hasNext !== false && !state.loading && !state.autoLoading && state.ads.size) loadMore();
+      },
+      { root: refs.overlay, rootMargin: '600px' }
+    ).observe(refs.sentinel);
+    return refs;
   }
 
-  function onChange(e) {
-    const t = e.target;
-    const key = t.dataset && t.dataset.filter;
-    if (!key) return;
-    if (key === 'maxDays') state.filters.maxDays = t.value === '' ? null : Math.max(0, Number(t.value));
-    else if (key === 'minCopies') state.filters.minCopies = Math.max(1, Number(t.value) || 1);
-    else state.filters[key] = t.value;
-    afterFilterChange();
-  }
-
-  function onInput(e) {
-    const t = e.target;
-    if (t.dataset && t.dataset.role === 'note') return;
-  }
-
-  function adFromEvent(target) {
-    const card = target.closest('.card');
-    if (!card) return {};
-    return { card, ad: state.ads.get(card.dataset.id) };
-  }
-
-  function onClick(e) {
+  function onLayerClick(e) {
     const btn = e.target.closest('[data-action]');
     if (!btn) {
-      if (ui.menu && !e.target.closest('.menu')) closeMenu();
+      if (menu && !e.target.closest('.menu')) closeMenu();
       return;
     }
+    if (menu && !btn.closest('.menu')) closeMenu();
     const action = btn.dataset.action;
     const value = btn.dataset.value;
-    const f = state.filters;
-    if (ui.menu && !btn.closest('.menu')) closeMenu();
-
     switch (action) {
-      case 'open':
-        return setOpen(true);
-      case 'close':
-        return setOpen(false);
-      case 'open-saved':
-        return chrome.runtime.sendMessage({ type: 'open-saved' });
-      case 'toggle-adv':
-        state.advOpen = !state.advOpen;
-        ui.adv.hidden = !state.advOpen;
-        if (state.advOpen) renderAdvanced();
-        return updateToolbar();
-      case 'dest':
-        f.dest = f.dest === value && value !== 'all' ? 'all' : value;
-        if (f.dest !== 'message' && f.dest !== 'all') f.channel = 'all';
-        return afterFilterChange();
-      case 'days':
-        f.minDays = Number(value);
-        ui.minDays.value = '';
-        return afterFilterChange();
-      case 'sort':
-        state.sort = value;
-        return afterFilterChange();
-      case 'status-active':
-        f.status = f.status === 'active' ? 'all' : 'active';
-        return afterFilterChange();
-      case 'media':
-      case 'platform':
-      case 'status':
-        f[action] = value;
-        return afterFilterChange();
-      case 'savedOnly':
-        f.savedOnly = value === 'true';
-        return afterFilterChange();
-      case 'reset-filters':
-        state.filters = BAP.defaultFilters();
-        ui.search.value = '';
-        return afterFilterChange();
-      case 'show-more':
-        state.renderLimit += PAGE_SIZE;
-        return renderGrid();
-      case 'load-more':
-        return loadMore();
-      case 'load-all':
-        return loadAll();
-      case 'stop-load':
-        state.autoLoading = false;
-        return updateLoadMore();
-      case 'download-all':
-        return downloadAds(state.view);
-      case 'export':
-        return exportAds(state.view, value);
-      case 'select-all': {
-        const allSel = state.view.length > 0 && state.view.every((a) => state.selected.has(a.id));
-        state.view.forEach((a) => (allSel ? state.selected.delete(a.id) : state.selected.add(a.id)));
-        return render();
+      case 'to-toolbar':
+        return tb.host.scrollIntoView({ block: 'start', behavior: 'smooth' });
+      case 'open-overlay':
+        return setOverlay(true);
+      case 'close-drawer':
+        return openDrawer(false);
+      case 'drawer-folder':
+        state.drawerFolder = value;
+        return renderDrawer();
+      case 'drawer-export':
+        return exportAds(drawerItems(), value, { saved: true, prefix: 'anuncios-guardados' });
+      case 'drawer-copy': {
+        const items = drawerItems();
+        if (!items.length) return toast('No hay guardados para copiar', true);
+        return copy(items.map((a) => a.url).join('\n'), `${items.length} links copiados`);
       }
+      case 'open-saved-page':
+        return chrome.runtime.sendMessage({ type: 'open-saved' });
       case 'sel-download':
         return downloadAds(selectedAds());
       case 'sel-save':
@@ -718,73 +1016,249 @@
       case 'sel-clear':
         state.selected.clear();
         return render();
+      case 'toast-action': {
+        const t = btn.closest('.toast');
+        if (t && t._fn) t._fn();
+        if (t) t.remove();
+        return;
+      }
     }
 
-    // Acciones de tarjeta
-    const { card, ad } = adFromEvent(btn);
+    // Guardados (filas del panel lateral)
+    const row = btn.closest('.srow');
+    if (row) {
+      const rec = state.saved[row.dataset.id];
+      if (!rec) return;
+      switch (action) {
+        case 's-copy':
+          return copy(rec.url, 'Link copiado');
+        case 's-download':
+          return downloadAds([rec]);
+        case 's-folder':
+          return openFolderMenu(btn, rec, (folder) => BAP.storage.patch(rec.id, { folder }).then(() => ensureFolder(folder)));
+        case 's-delete':
+          return unsave([rec.id]);
+      }
+      return;
+    }
+
+    // Tarjetas de la vista en grilla (respaldo)
+    const card = btn.closest('.card');
+    const ad = card && state.ads.get(card.dataset.id);
     if (!ad) return;
     if (BAP.handleMediaAction(action, card, ad)) return;
-    switch (action) {
-      case 'select':
-        if (state.selected.has(ad.id)) state.selected.delete(ad.id);
-        else state.selected.add(ad.id);
-        card.classList.toggle('selected', state.selected.has(ad.id));
-        updateSelbar();
-        updateToolbar();
-        return;
-      case 'save':
-        if (state.saved[ad.id]) return unsave([ad.id]);
-        return saveAds([ad]);
-      case 'save-menu':
-        return openFolderMenu(btn, ad, (folder) => saveAds([ad], folder));
-      case 'download':
-        return downloadAds([ad]);
-      case 'more':
-        return openMoreMenu(btn, ad);
+    cardAction(action, ad, btn);
+  }
+
+  async function ensureFolder(folder) {
+    if (!state.folders.includes(folder)) {
+      state.folders.push(folder);
+      await BAP.storage.setFolders(state.folders);
     }
   }
 
-  function selectedAds() {
-    return [...state.selected].map((id) => state.ads.get(id)).filter(Boolean);
+  // ---------- Panel lateral de guardados ----------
+  function openDrawer(open) {
+    state.drawerOpen = open;
+    layer.drawer.hidden = !open;
+    layer.scrim.hidden = !open;
+    closeMenu();
+    if (open) {
+      renderDrawer();
+      setTimeout(() => layer.drawerSearch.focus(), 50);
+    }
+  }
+
+  function drawerItems() {
+    const f = Object.assign(BAP.defaultFilters(), { text: state.drawerText });
+    return Object.values(state.saved)
+      .filter((a) => (state.drawerFolder === '__all' || a.folder === state.drawerFolder) && BAP.matches(a, f))
+      .sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0));
+  }
+
+  function renderDrawer() {
+    if (!layer || !state.drawerOpen) return;
+    const all = Object.values(state.saved);
+    layer.drawerN.textContent = all.length;
+    const counts = {};
+    for (const a of all) counts[a.folder] = (counts[a.folder] || 0) + 1;
+    if (state.drawerFolder !== '__all' && !state.folders.includes(state.drawerFolder)) state.drawerFolder = '__all';
+    layer.drawerFolders.innerHTML = [['__all', 'Todas', all.length], ...state.folders.map((f) => [f, f, counts[f] || 0])]
+      .map(([k, l, n]) => `<button class="chip ${state.drawerFolder === k ? 'on' : ''}" data-action="drawer-folder" data-value="${esc(k)}">${k === '__all' ? '' : icon('folder', 13)}${esc(l)}<span class="count">${n}</span></button>`)
+      .join('');
+    const items = drawerItems();
+    if (!items.length) {
+      layer.drawerList.innerHTML = `<div class="empty" style="padding:50px 10px">${icon('bookmark', 34)}<h3>${all.length ? 'Nada por acá' : 'Todavía no guardaste anuncios'}</h3><p>${
+        all.length ? 'Probá con otra carpeta o búsqueda.' : 'Tocá “Guardar” en cualquier anuncio y aparece acá, con su link listo para volver a verlo.'
+      }</p></div>`;
+      return;
+    }
+    layer.drawerList.innerHTML = items
+      .map((a) => {
+        const dest = BAP.destByKey[a.dest] || BAP.destByKey.other;
+        const thumb = a.thumbData || a.thumb;
+        return `<div class="srow" data-id="${esc(a.id)}">
+          <a class="sthumb" href="${esc(a.url)}" target="_blank" rel="noopener" title="Abrir anuncio">${thumb ? `<img src="${esc(thumb)}" alt="" loading="lazy" referrerpolicy="no-referrer">` : icon('image', 20)}${a.mediaType === 'video' ? `<span class="splay">${icon('play', 12)}</span>` : ''}</a>
+          <div class="sbody">
+            <a class="sname" href="${esc(a.url)}" target="_blank" rel="noopener">${esc(a.pageName)}</a>
+            <div class="smeta">
+              <span class="days ${BAP.daysTone(a.days)}">${BAP.fmtDays(a.days)}</span>
+              <span class="dest tone-${dest.tone}">${icon(dest.icon, 12)}<span class="lbl">${esc(dest.label)}</span></span>
+            </div>
+            <div class="stext">${esc((a.body || a.title || '').slice(0, 140))}</div>
+            <input class="input snote" data-role="note" placeholder="Agregar nota…" value="${esc(a.note || '')}">
+            <div class="sacts">
+              <a class="btn btn-soft" href="${esc(a.url)}" target="_blank" rel="noopener">${icon('external', 13)}Ver anuncio</a>
+              <button class="btn" data-action="s-copy" title="Copiar link">${icon('link', 13)}</button>
+              <button class="btn" data-action="s-download" title="Descargar">${icon('download', 13)}</button>
+              <button class="btn" data-action="s-folder" title="Mover de carpeta">${icon('folder', 13)}<span>${esc(a.folder)}</span></button>
+              <button class="btn btn-danger" data-action="s-delete" title="Eliminar">${icon('trash', 13)}</button>
+            </div>
+          </div>
+        </div>`;
+      })
+      .join('');
+    layer.drawerList.querySelectorAll('img').forEach((img) =>
+      img.addEventListener('error', () => {
+        img.replaceWith(document.createRange().createContextualFragment(icon('image', 20)));
+      })
+    );
+  }
+
+  // ---------- Selección ----------
+  function updateSelbar() {
+    if (!layer) return;
+    const n = state.selected.size;
+    layer.selbar.hidden = !n;
+    if (!n) return;
+    layer.selbar.innerHTML = `<span>${n} seleccionado${n > 1 ? 's' : ''}</span>
+      <button class="btn btn-primary" data-action="sel-download">${icon('download', 14)}Descargar</button>
+      <button class="btn" data-action="sel-save">${icon('bookmark', 14)}Guardar</button>
+      <button class="btn" data-action="sel-export">${icon('sheet', 14)}Excel</button>
+      <button class="btn" data-action="sel-copy">${icon('link', 14)}Copiar links</button>
+      <button class="btn" data-action="sel-clear" title="Quitar selección">${icon('x', 14)}</button>`;
+  }
+
+  // ---------- Respaldo: vista en grilla ----------
+  let fallbackTimer = null;
+  function updateFallback() {
+    if (!layer) return;
+    const integrated = native.cards.size > 0;
+    if (integrated) {
+      clearTimeout(fallbackTimer);
+      fallbackTimer = null;
+      state.mode = 'native';
+      if (!state.overlayOpen) layer.launcher.hidden = true;
+      return;
+    }
+    if (state.ads.size && !fallbackTimer && state.mode === 'native') {
+      // Si en unos segundos no reconocemos las tarjetas de Facebook, mostramos la vista de respaldo.
+      fallbackTimer = setTimeout(() => {
+        if (native.cards.size) return;
+        state.mode = 'fallback';
+        layer.launcher.hidden = state.overlayOpen;
+        layer.launchN.textContent = `${state.ads.size} anuncios`;
+      }, 5000);
+    }
+    if (state.mode === 'fallback') {
+      layer.launcher.hidden = state.overlayOpen;
+      layer.launchN.textContent = `${state.ads.size} anuncios`;
+    }
+  }
+
+  function setOverlay(open) {
+    state.overlayOpen = open;
+    layer.overlay.hidden = !open;
+    layer.launcher.hidden = open || state.mode !== 'fallback';
+    closeMenu();
+    if (open) {
+      layer.overlayTop.appendChild(tb.host);
+      tb.closeBtn.hidden = false;
+      renderOverlayGrid();
+    } else {
+      layer.overlay.querySelectorAll('video').forEach((v) => v.pause());
+      tb.closeBtn.hidden = true;
+      if (native.cards.size) placeToolbar();
+      else tb.host.remove();
+    }
+  }
+
+  function getOverlayCard(ad) {
+    let el = overlayCards.get(ad.id);
+    if (!el) {
+      el = BAP.renderCard(ad, { mode: 'live', savedFolder: (state.saved[ad.id] || {}).folder || null, selected: state.selected.has(ad.id) });
+      overlayCards.set(ad.id, el);
+    }
+    el.classList.toggle('selected', state.selected.has(ad.id));
+    return el;
+  }
+
+  function renderOverlayGrid() {
+    const list = state.view.slice(0, state.renderLimit);
+    layer.empty.hidden = list.length > 0;
+    if (!list.length) {
+      layer.empty.innerHTML = state.ads.size
+        ? `${icon('filter', 40)}<h3>Ningún anuncio coincide con los filtros</h3><p>Hay ${state.ads.size} anuncios cargados. Probá quitar algún filtro.</p>`
+        : `${icon('search', 40)}<h3>Todavía no hay anuncios cargados</h3><p>Hacé una búsqueda en la Biblioteca de anuncios.</p>`;
+    }
+    const grid = layer.grid;
+    const current = [...grid.children];
+    const same = current.length === list.length && current.every((n, i) => n.dataset.id === list[i].id);
+    if (same) list.forEach((ad) => getOverlayCard(ad));
+    else {
+      const wanted = new Set(list.map((a) => a.id));
+      current.forEach((n) => !wanted.has(n.dataset.id) && n.remove());
+      let ref = grid.firstElementChild;
+      for (const ad of list) {
+        const el = getOverlayCard(ad);
+        if (el === ref) ref = ref.nextElementSibling;
+        else grid.insertBefore(el, ref);
+      }
+    }
+    renderOverlayLoadMore();
+  }
+
+  function renderOverlayLoadMore() {
+    const busy = state.loading || state.autoLoading;
+    let html = '';
+    if (state.renderLimit < state.view.length) html = `<span class="hint">Bajá para ver más…</span>`;
+    else if (state.ads.size && state.hasNext !== false) html = busy ? `<span class="btn" style="pointer-events:none"><span class="spinner"></span>Cargando más anuncios…</span>` : '';
+    else if (state.ads.size && state.hasNext === false) html = `<div class="hint">No hay más resultados para esta búsqueda.</div>`;
+    layer.loadmore.innerHTML = html;
   }
 
   // ---------- Menús ----------
-
   function closeMenu() {
-    if (ui && ui.menu) {
-      ui.menu.remove();
-      ui.menu = null;
+    if (menu) {
+      menu.remove();
+      menu = null;
     }
   }
 
-  function placeMenu(menu, anchor) {
-    ui.root.querySelector('.bap').appendChild(menu);
+  function placeMenu(m, anchor) {
+    layer.wrap.appendChild(m);
     const r = anchor.getBoundingClientRect();
-    const mw = menu.offsetWidth;
-    const mh = menu.offsetHeight;
-    let left = Math.min(r.right - mw, window.innerWidth - mw - 8);
-    left = Math.max(8, left);
+    let left = Math.max(8, Math.min(r.right - m.offsetWidth, window.innerWidth - m.offsetWidth - 8));
     let top = r.bottom + 6;
-    if (top + mh > window.innerHeight - 8) top = Math.max(8, r.top - mh - 6);
-    menu.style.left = left + 'px';
-    menu.style.top = top + 'px';
-    ui.menu = menu;
+    if (top + m.offsetHeight > window.innerHeight - 8) top = Math.max(8, r.top - m.offsetHeight - 6);
+    m.style.left = left + 'px';
+    m.style.top = top + 'px';
+    menu = m;
   }
 
   function openFolderMenu(anchor, ad, onPick) {
     closeMenu();
-    const menu = document.createElement('div');
-    menu.className = 'menu';
+    const m = document.createElement('div');
+    m.className = 'menu';
     const current = ad && state.saved[ad.id] ? state.saved[ad.id].folder : null;
-    menu.innerHTML =
+    m.innerHTML =
       `<div class="mh">Guardar en carpeta</div>` +
-      state.folders
-        .map((fo) => `<button class="mi ${fo === current ? 'on' : ''}" data-folder="${esc(fo)}">${icon(fo === current ? 'check' : 'folder', 15)}${esc(fo)}</button>`)
-        .join('') +
+      state.folders.map((fo) => `<button class="mi ${fo === current ? 'on' : ''}" data-folder="${esc(fo)}">${icon(fo === current ? 'check' : 'folder', 15)}${esc(fo)}</button>`).join('') +
       `<div class="sep"></div>
-       <form data-role="newfolder"><input class="input" placeholder="Nueva carpeta…" maxlength="40"><button class="btn btn-primary" type="submit">${icon('folderPlus', 14)}</button></form>` +
+       <form><input class="input" placeholder="Nueva carpeta…" maxlength="40"><button class="btn btn-primary" type="submit" title="Crear y guardar">${icon('folderPlus', 14)}</button></form>` +
       (current ? `<div class="sep"></div><button class="mi danger" data-unsave="1">${icon('trash', 15)}Quitar de guardados</button>` : '');
-    menu.addEventListener('click', (e) => {
+    m.addEventListener('click', (e) => {
+      e.stopPropagation();
       const b = e.target.closest('button');
       if (!b) return;
       if (b.dataset.folder) {
@@ -795,20 +1269,20 @@
         unsave([ad.id]);
       }
     });
-    menu.querySelector('form').addEventListener('submit', (e) => {
+    m.querySelector('form').addEventListener('submit', (e) => {
       e.preventDefault();
       const name = e.target.querySelector('input').value.trim();
       if (!name) return;
       closeMenu();
       onPick(name);
     });
-    placeMenu(menu, anchor);
+    placeMenu(m, anchor);
   }
 
   function openMoreMenu(anchor, ad) {
     closeMenu();
-    const menu = document.createElement('div');
-    menu.className = 'menu';
+    const m = document.createElement('div');
+    m.className = 'menu';
     const pageAds = ad.pageId
       ? `https://www.facebook.com/ads/library/?active_status=all&ad_type=all&country=ALL&view_all_page_id=${encodeURIComponent(ad.pageId)}&search_type=page&media_type=all`
       : '';
@@ -817,19 +1291,17 @@
       ['copy-id', 'copy', 'Copiar ID'],
       ad.body ? ['copy-text', 'copy', 'Copiar texto del anuncio'] : null,
       'sep',
-      ['open-ad', 'external', 'Abrir anuncio en pestaña nueva'],
       pageAds ? ['page-ads', 'library', 'Ver todos los anuncios de esta página'] : null,
-      ad.pageUrl ? ['open-page', 'user', 'Abrir página del anunciante'] : null,
       ad.linkUrl ? ['open-dest', 'globe', 'Abrir destino del botón'] : null,
     ].filter(Boolean);
-    menu.innerHTML =
-      `<div class="mh">${esc(ad.ctaType || 'Sin CTA')}${ad.channel ? ' · ' + esc(ad.channel) : ''}</div>` +
+    m.innerHTML =
+      `<div class="mh">${esc(ad.ctaText || 'Sin botón')}${ad.ctaType ? ' · ' + esc(ad.ctaType) : ''}</div>` +
       items.map((it) => (it === 'sep' ? '<div class="sep"></div>' : `<button class="mi" data-m="${it[0]}">${icon(it[1], 15)}${esc(it[2])}</button>`)).join('');
-    menu.addEventListener('click', (e) => {
+    m.addEventListener('click', (e) => {
+      e.stopPropagation();
       const b = e.target.closest('[data-m]');
       if (!b) return;
       closeMenu();
-      const open = (u) => window.open(u, '_blank', 'noopener');
       switch (b.dataset.m) {
         case 'copy-link':
           return copy(ad.url, 'Link copiado');
@@ -837,28 +1309,35 @@
           return copy(ad.id, 'ID copiado');
         case 'copy-text':
           return copy(ad.body, 'Texto copiado');
-        case 'open-ad':
-          return open(ad.url);
         case 'page-ads':
-          return open(pageAds);
-        case 'open-page':
-          return open(ad.pageUrl);
+          return (location.href = pageAds);
         case 'open-dest':
-          return open(ad.linkUrl);
+          return window.open(ad.linkUrl, '_blank', 'noopener');
       }
     });
-    placeMenu(menu, anchor);
+    placeMenu(m, anchor);
   }
 
+  document.addEventListener(
+    'click',
+    (e) => {
+      if (!menu) return;
+      const path = e.composedPath();
+      if (!path.includes(menu)) closeMenu();
+    },
+    true
+  );
+
   // ---------- Toasts ----------
-  function toast(msg, isErr) {
-    if (!ui) return;
+  function toast(msg, isErr, action) {
+    if (!layer) return;
     const t = document.createElement('div');
     t.className = 'toast' + (isErr ? ' err' : '');
     t.setAttribute('role', 'status');
-    t.innerHTML = `${icon(isErr ? 'x' : 'check', 15)}<span>${esc(msg)}</span>`;
-    ui.toasts.appendChild(t);
-    setTimeout(() => t.remove(), 3200);
+    t.innerHTML = `${icon(isErr ? 'x' : 'check', 15)}<span>${esc(msg)}</span>${action ? `<button class="toast-btn" data-action="toast-action">${esc(action.label)}</button>` : ''}`;
+    if (action) t._fn = action.fn;
+    layer.toasts.appendChild(t);
+    setTimeout(() => t.remove(), action ? 5000 : 3200);
   }
 
   function debounce(fn, ms) {
@@ -870,16 +1349,46 @@
   }
 
   // ======================= Inicio =======================
+
+  function handleEscape() {
+    if (menu) closeMenu();
+    else if (state.drawerOpen) openDrawer(false);
+    else if (state.overlayOpen) setOverlay(false);
+    else return false;
+    return true;
+  }
+
+  // Las teclas escritas en nuestros campos no deben llegar a los atajos de Facebook (salvo Escape, que manejamos acá).
+  function stopKeys(e) {
+    e.stopPropagation();
+    if (e.type === 'keydown' && e.key === 'Escape') handleEscape();
+  }
+
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && handleEscape()) e.stopPropagation();
+  });
+
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (!msg || !tb) return;
+    if (msg.type === 'open-drawer') openDrawer(true);
+    if (msg.type === 'toggle-panel') {
+      if (state.mode === 'fallback' || !native.cards.size) setOverlay(!state.overlayOpen);
+      else tb.host.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    }
+  });
+
   async function init() {
-    await loadStorage();
-    const start = () => buildUI();
+    await Promise.all([loadStorage(), loadCss()]);
+    const start = () => {
+      tb = buildToolbar();
+      layer = buildLayer();
+      observePage();
+      render();
+      scan();
+    };
     if (document.body) start();
     else document.addEventListener('DOMContentLoaded', start, { once: true });
   }
-
-  chrome.runtime.onMessage.addListener((msg) => {
-    if (msg && msg.type === 'toggle-panel' && ui) setOpen(!state.open);
-  });
 
   init();
 })();

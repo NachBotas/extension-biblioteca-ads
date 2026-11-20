@@ -1,37 +1,98 @@
-/* Estilos específicos del panel que se abre sobre la Biblioteca de anuncios */
-.overlay {
-  position: fixed; inset: 0; z-index: 2147483000; background: var(--bg);
-  overflow-y: scroll; overscroll-behavior: contain;
+/* Estilos de la integración dentro de la página de la Biblioteca de anuncios */
+
+/* ---------- Barra de herramientas (arriba de los resultados) ---------- */
+.tbar {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow-sm);
+  padding: 12px 14px; display: flex; flex-direction: column; gap: 10px;
 }
-.topbar {
-  position: sticky; top: 0; z-index: 10; background: rgba(255,255,255,.96); backdrop-filter: saturate(1.4) blur(6px);
-  border-bottom: 1px solid var(--border);
-}
-.topbar-in { max-width: 1680px; margin: 0 auto; padding: 10px 24px; display: flex; flex-direction: column; gap: 10px; }
-.brand-row { display: flex; align-items: center; gap: 14px; }
-.brand { display: flex; align-items: center; gap: 9px; font-weight: 800; font-size: 15px; letter-spacing: -.01em; }
-.logo { width: 30px; height: 30px; border-radius: 8px; background: linear-gradient(135deg, #8b7cf8, #5b4be8); color: #fff; display: flex; align-items: center; justify-content: center; }
+.brand { display: flex; align-items: center; gap: 8px; font-weight: 800; font-size: 14.5px; letter-spacing: -.01em; white-space: nowrap; }
+.logo { width: 28px; height: 28px; border-radius: 8px; background: linear-gradient(135deg, #8b7cf8, #5b4be8); color: #fff; display: flex; align-items: center; justify-content: center; flex: none; }
 .stats { font-size: 13px; color: var(--muted); display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 .stats b { color: var(--text); }
 .stats .dot { width: 3px; height: 3px; border-radius: 50%; background: var(--faint); }
 .spacer { flex: 1; }
 .tb-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.tb-row .sep { width: 1px; height: 22px; background: var(--border); margin: 0 4px; }
-.dest-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.seg .input-num { height: 26px; width: 72px; margin-left: 2px; }
+.dest-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding-top: 2px; }
 .dest-row .lbl { font-size: 12px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; margin-right: 4px; }
 .adv { display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-end; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-2); }
-.adv .chips { display: flex; gap: 5px; flex-wrap: wrap; }
+.adv .chips, .chips { display: flex; gap: 5px; flex-wrap: wrap; }
 .adv .chip { height: 28px; font-size: 12.5px; }
 .filter-count { min-width: 18px; height: 18px; border-radius: 999px; background: var(--primary); color: #fff; font-size: 11px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; padding: 0 5px; }
 .btn.active-filter { border-color: var(--primary); color: var(--primary-600); background: var(--primary-50); }
 
-.content { max-width: 1680px; margin: 0 auto; padding: 18px 24px 120px; }
+/* ---------- Bloque dentro de cada tarjeta de Facebook ---------- */
+.nb { display: flex; flex-direction: column; gap: 8px; padding: 10px 0 12px; }
+.nb.nb-top { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+.nb.selected .check .box { background: var(--primary); border-color: var(--primary); }
+.nb.selected .check { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-100); }
+.nb-kpis { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.nb-kpis > * { flex: none; }
+.nb-kpis > .dest { flex: 0 1 auto; min-width: 0; }
+.nb-kpis .spacer { flex: 1; }
+.nb .icon-btn { width: 28px; height: 28px; }
+
+/* ---------- Pastilla flotante para volver a los filtros ---------- */
+.pill {
+  position: fixed; z-index: 2147483000; right: 22px; bottom: 22px; display: inline-flex; align-items: center; gap: 7px;
+  height: 42px; padding: 0 16px; border-radius: 999px; border: 0; background: var(--primary); color: #fff;
+  box-shadow: 0 10px 30px rgba(91, 75, 232, .4); font-weight: 700; font-size: 13.5px;
+}
+.pill:hover { background: var(--primary-600); }
+
+/* ---------- Panel lateral de guardados ---------- */
+.scrim { position: fixed; inset: 0; z-index: 2147483010; background: rgba(15, 18, 30, .28); }
+.drawer {
+  position: fixed; z-index: 2147483020; top: 0; right: 0; bottom: 0; width: min(440px, 100vw);
+  background: var(--surface); box-shadow: var(--shadow-lg); display: flex; flex-direction: column;
+  animation: drawer-in .2s ease-out;
+}
+@keyframes drawer-in { from { transform: translateX(24px); opacity: 0; } to { transform: none; opacity: 1; } }
+.drawer-h { display: flex; align-items: center; gap: 8px; padding: 14px 14px 10px 18px; border-bottom: 1px solid var(--border); }
+.drawer-h .brand { font-size: 16px; }
+.drawer-tools { display: flex; flex-direction: column; gap: 10px; padding: 12px 18px; border-bottom: 1px solid var(--border); }
+.drawer-tools .search .input { width: 100%; }
+.drawer-tools .search { display: flex; }
+.drawer-tools .chip { height: 28px; font-size: 12.5px; }
+.drawer-list { flex: 1; overflow-y: auto; overscroll-behavior: contain; padding: 6px 10px; }
+.drawer-f { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 12px 14px; border-top: 1px solid var(--border); background: var(--surface-2); }
+.srow { display: flex; gap: 12px; padding: 12px 8px; border-bottom: 1px solid var(--border); }
+.srow:last-child { border-bottom: 0; }
+.sthumb { position: relative; flex: none; width: 72px; height: 96px; border-radius: 8px; overflow: hidden; background: #eceef1; display: flex; align-items: center; justify-content: center; color: var(--faint); }
+.sthumb img { width: 100%; height: 100%; object-fit: cover; }
+.splay { position: absolute; left: 6px; bottom: 6px; width: 22px; height: 22px; border-radius: 50%; background: rgba(0,0,0,.6); color: #fff; display: flex; align-items: center; justify-content: center; }
+.sbody { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+.sname { font-weight: 700; font-size: 13.5px; text-decoration: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sname:hover { text-decoration: underline; }
+.smeta { display: flex; gap: 5px; align-items: center; min-width: 0; }
+.smeta .days { height: 22px; font-size: 12px; padding: 0 8px; }
+.smeta .dest { height: 22px; font-size: 11.5px; min-width: 0; }
+.stext { font-size: 12.5px; color: var(--muted); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.snote { height: 28px; font-size: 12.5px; }
+.sacts { display: flex; gap: 5px; flex-wrap: nowrap; }
+.sacts .btn { height: 28px; padding: 0 9px; font-size: 12.5px; }
+.sacts .btn span { max-width: 64px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ---------- Vista en grilla (respaldo) ---------- */
+.overlay { position: fixed; inset: 0; z-index: 2147483000; background: var(--bg); overflow-y: scroll; overscroll-behavior: contain; }
+.overlay-top { position: sticky; top: 0; z-index: 10; padding: 12px 24px; background: rgba(240, 242, 245, .94); backdrop-filter: blur(6px); }
+.overlay-top bap-toolbar { margin: 0 !important; }
+.content { max-width: 1680px; margin: 0 auto; padding: 8px 24px 120px; }
 .sentinel { height: 1px; }
 .loadmore { display: flex; justify-content: center; gap: 10px; padding: 26px 0 0; }
 .hint { font-size: 12.5px; color: var(--muted); text-align: center; padding-top: 10px; }
+.launcher {
+  position: fixed; z-index: 2147482999; right: 22px; bottom: 22px; display: flex; align-items: center; gap: 10px;
+  height: 46px; padding: 0 8px 0 10px; border-radius: 999px; border: 0; background: var(--primary); color: #fff;
+  box-shadow: 0 10px 30px rgba(91, 75, 232, .45); font-weight: 700; font-size: 14px;
+}
+.launcher:hover { background: var(--primary-600); }
+.launcher .logo { width: 30px; height: 30px; background: rgba(255,255,255,.18); border-radius: 50%; }
+.launcher .n { background: #fff; color: var(--primary-600); border-radius: 999px; padding: 4px 10px; font-size: 13px; }
 
+/* ---------- Selección, toasts, menús ---------- */
 .selbar {
-  position: fixed; z-index: 20; left: 50%; bottom: 20px; transform: translateX(-50%);
+  position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%);
   background: #1f2128; color: #fff; border-radius: 12px; padding: 8px 8px 8px 16px; display: flex; align-items: center; gap: 8px;
   box-shadow: var(--shadow-lg); font-size: 13px; font-weight: 600;
 }
@@ -39,23 +100,13 @@
 .selbar .btn:hover { background: rgba(255,255,255,.18); }
 .selbar .btn-primary { background: var(--primary); }
 .selbar .btn-primary:hover { background: var(--primary-600); }
-
-/* Lanzador flotante */
-.launcher {
-  position: fixed; z-index: 2147482999; right: 22px; bottom: 22px; display: flex; align-items: center; gap: 10px;
-  height: 46px; padding: 0 8px 0 10px; border-radius: 999px; border: 0; background: var(--primary); color: #fff;
-  box-shadow: 0 10px 30px rgba(91, 75, 232, .45); font-weight: 700; font-size: 14px;
-  transition: transform .15s, background .15s;
-}
-.launcher:hover { background: var(--primary-600); transform: translateY(-1px); }
-.launcher .logo { width: 30px; height: 30px; background: rgba(255,255,255,.18); border-radius: 50%; }
-.launcher .n { background: #fff; color: var(--primary-600); border-radius: 999px; padding: 4px 10px; font-size: 13px; }
+.toast-btn { border: 0; background: rgba(255,255,255,.14); color: #fff; border-radius: 6px; height: 26px; padding: 0 10px; font-size: 12.5px; font-weight: 600; margin-left: 4px; }
+.toast-btn:hover { background: rgba(255,255,255,.24); }
+.menu, .toasts, .selbar { z-index: 2147483100; }
 
 @media (max-width: 720px) {
-  .topbar-in, .content { padding-left: 12px; padding-right: 12px; }
+  .overlay-top, .content { padding-left: 12px; padding-right: 12px; }
   .search .input { width: 160px; }
   .grid { grid-template-columns: 1fr; }
 }
-
-/* Menús, toasts y barra de selección por encima del panel */
-.menu, .toasts, .selbar { z-index: 2147483100; }
+@media (prefers-reduced-motion: reduce) { .drawer { animation: none; } }

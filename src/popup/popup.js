@@ -2,7 +2,7 @@
   const BAP = window.BAP;
   const $ = (id) => document.getElementById(id);
   $('logo').innerHTML = BAP.icon('library', 18);
-  $('panel').innerHTML = `${BAP.icon('grid', 16)}Abrir panel en esta pestaña`;
+  $('panel').innerHTML = `${BAP.icon('filter', 16)}Ir a los filtros en esta pestaña`;
   $('saved').innerHTML = `${BAP.icon('bookmark', 16)}Ver anuncios guardados`;
   $('lib').innerHTML = `${BAP.icon('external', 14)}Ir a la Biblioteca de anuncios`;
 
@@ -23,6 +23,15 @@
     window.close();
   });
   $('saved').addEventListener('click', async () => {
+    // En la Biblioteca se abre el panel lateral en la misma pestaña; en otro lado, la página de guardados.
+    if (onLibrary) {
+      try {
+        await chrome.tabs.sendMessage(tab.id, { type: 'open-drawer' });
+        return window.close();
+      } catch (e) {
+        /* sigue abajo */
+      }
+    }
     await chrome.runtime.sendMessage({ type: 'open-saved' });
     window.close();
   });
