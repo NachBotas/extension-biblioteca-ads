@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Anuncios guardados</title>
+  <link rel="icon" href="../../icons/icon32.png">
+  <link rel="stylesheet" href="../shared/ui.css">
+  <link rel="stylesheet" href="saved.css">
+</head>
+<body class="bap">
+  <header class="top">
+    <div class="brand"><span class="logo" id="logo"></span><span>Biblioteca Ads Pro</span><span class="crumb">/ Guardados</span></div>
+    <div class="spacer"></div>
+    <a class="btn" href="https://www.facebook.com/ads/library/" target="_blank" rel="noopener" id="goLibrary"></a>
+  </header>
+
+  <div class="layout">
+    <aside class="side">
+      <div class="side-h">
+        <span>Carpetas</span>
+        <button class="icon-btn" id="newFolder" title="Nueva carpeta"></button>
+      </div>
+      <nav id="folders"></nav>
+      <div class="side-foot">
+        <button class="btn btn-ghost btn-block" id="backup"></button>
+        <label class="btn btn-ghost btn-block" id="restoreLbl"><input type="file" accept="application/json,.json" id="restore" hidden></label>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div class="toolbar">
+        <div class="tb-row">
+          <h1 id="title">Todos los guardados</h1>
+          <span class="count-pill" id="countPill">0</span>
+          <div class="spacer"></div>
+          <label class="search" id="searchWrap"><input class="input" type="search" id="search" placeholder="Buscar por anunciante, texto, link…"></label>
+        </div>
+        <div class="tb-row" id="destRow"></div>
+        <div class="tb-row">
+          <div class="seg" id="sortSeg"></div>
+          <div class="spacer"></div>
+          <button class="btn btn-ghost" id="selectAll">Seleccionar todos</button>
+          <button class="btn" id="exportXlsx"></button>
+          <button class="btn" id="exportCsv">CSV</button>
+        </div>
+      </div>
+      <div class="grid" id="grid"></div>
+      <div class="empty" id="empty" hidden></div>
+    </main>
+  </div>
+
+  <div class="selbar" id="selbar" hidden></div>
+  <div class="toasts" id="toasts"></div>
+
+  <script src="../shared/core.js"></script>
+  <script src="../shared/export.js"></script>
+  <script src="../shared/card.js"></script>
+  <script src="saved.js"></script>
+</body>
+</html>
