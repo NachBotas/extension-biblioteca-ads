@@ -39,9 +39,10 @@
     drawerOpen: false,
     drawerFolder: '__all',
     drawerText: '',
+    searchKey: '',
   };
 
-  const native = { cards: new Map(), grid: null, flat: new Set(), ordered: new Set() };
+  const native = { cards: new Map(), grid: null, flat: new Set(), ordered: new Set(), version: 0, flatVersion: -1, tbVersion: -1 };
   const overlayCards = new Map();
   let css = '';
   let sheet = null;
@@ -54,9 +55,15 @@
   window.addEventListener('message', (ev) => {
     if (ev.source !== window || !ev.data || ev.data.source !== 'BAP_HOOK') return;
     const { type, payload } = ev.data;
-    if (type === 'reset') resetAds();
+    if (type === 'reset') {
+      const key = searchKey();
+      if (key === state.searchKey) return; // Facebook volvió a pedir la misma búsqueda: no borrar nada
+      state.searchKey = key;
+      resetAds();
+    }
     else if (type === 'ads') ingest(payload || {});
   });
+  state.searchKey = searchKey();
   window.postMessage({ source: 'BAP_CS', type: 'hello' }, location.origin);
 
   function ingest(payload) {
@@ -78,12 +85,20 @@
       if (payload.meta.hasNext != null) state.hasNext = payload.meta.hasNext;
     }
     if (added) {
-      scheduleScan();
+      scheduleScan(true);
       scheduleRender();
     } else scheduleRender();
   }
 
+  function searchKey() {
+    const p = new URLSearchParams(location.search);
+    p.delete('id');
+    p.sort();
+    return location.pathname + '?' + p.toString();
+  }
+
   function resetAds() {
+    clearNative();
     state.ads.clear();
     state.selected.clear();
     state.total = null;
@@ -257,6 +272,8 @@
 
   const PAGE_CSS = `
     [data-bap-hide] { display: none !important; }
+    /* Las tarjetas fuera de pantalla no se dibujan hasta que hace falta: listas largas mucho más livianas. */
+    [data-bap-card] { content-visibility: auto; contain-intrinsic-size: auto 900px; }
     [data-bap-flat] { display: contents !important; }
     [data-bap-grid] {
       display: grid !important; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)) !important;
@@ -477,16 +494,29 @@
     });
   }
 
+  // En la página se trabaja solo con los anuncios que están a la vista (sus tarjetas);
+  // en la vista de respaldo, con todo lo cargado.
+  let baseCache = null;
+  function baseAds() {
+    if (baseCache) return baseCache;
+    if (native.cards.size && !state.overlayOpen) {
+      baseCache = [];
+      for (const id of native.cards.keys()) {
+        const ad = state.ads.get(id);
+        if (ad) baseCache.push(ad);
+      }
+    } else baseCache = [...state.ads.values()];
+    return baseCache;
+  }
+
   function filteredExcept(key) {
     const f = Object.assign({}, state.filters, { [key]: BAP.defaultFilters()[key] });
-    const out = [];
-    for (const ad of state.ads.values()) if (BAP.matches(ad, f, state.saved)) out.push(ad);
-    return out;
+    return baseAds().filter((ad) => BAP.matches(ad, f, state.saved));
   }
 
   function computeView() {
-    const list = [];
-    for (const ad of state.ads.values()) if (BAP.matches(ad, state.filters, state.saved)) list.push(ad);
+    baseCache = null;
+    const list = baseAds().filter((ad) => BAP.matches(ad, state.filters, state.saved));
     state.view = BAP.sortAds(list, state.sort);
     state.viewIds = new Set(state.view.map((a) => a.id));
   }
@@ -508,7 +538,7 @@
   function updateStats() {
     const parts = [];
     if (state.total != null) parts.push(`<span>~<b>${BAP.fmtNum(state.total)}</b> resultados</span>`);
-    parts.push(`<span><b>${state.ads.size}</b> cargados</span>`);
+    parts.push(`<span><b>${baseAds().length}</b> en la página</span>`);
     parts.push(`<span><b>${state.view.length}</b> visibles con filtros</span>`);
     tb.stats.innerHTML = parts.join('<span class="dot"></span>');
     tb.savedN.textContent = Object.keys(state.saved).length;
@@ -532,7 +562,7 @@
     if (tb.root.activeElement !== tb.minDays) tb.minDays.value = [0, 7, 30, 60, 90].includes(Number(f.minDays)) ? '' : f.minDays || '';
     tb.sortSeg.querySelectorAll('button').forEach((b) => b.classList.toggle('on', b.dataset.value === state.sort));
     const rb = tb.sortSeg.querySelector('[data-reach]');
-    if (rb) rb.hidden = ![...state.ads.values()].some((a) => a.reach != null);
+    if (rb) rb.hidden = !baseAds().some((a) => a.reach != null);
     tb.activeChip.classList.toggle('on', f.status === 'active');
     const n = activeFilterCount();
     tb.filterN.hidden = !n;
@@ -608,51 +638,109 @@
   }
 
   // ======================= Integración con las tarjetas de Facebook =======================
+  // Rendimiento: la búsqueda de tarjetas usa XPath (nativo del navegador, no JS nodo por nodo),
+  // corre como máximo cada ~0,5 s y solo cuando Facebook agrega contenido con IDs de anuncios.
+  // Primero se lee todo (sin tocar la página) y después se escribe, para no forzar recálculos de diseño.
+  const DIGITS_XPATH =
+    ".//text()[string-length(.) - string-length(translate(., '0123456789', '')) >= 13][not(ancestor::script or ancestor::style or ancestor::noscript)]";
+  const ID_LABEL = /:\s*\d{13,20}\s*$/;
+  const STOP_SEL = 'input, textarea, [role="search"], [role="dialog"], bap-toolbar, header, nav';
 
   let scanTimer = null;
-  function scheduleScan(delay = 250) {
-    clearTimeout(scanTimer);
-    scanTimer = setTimeout(scan, delay);
+  let lastScanAt = 0;
+  let needFull = false;
+  const pendingNodes = new Set();
+  // full = revisar toda la página (cuando llegan datos nuevos). Si no, solo lo que agregó Facebook.
+  function scheduleScan(full = true) {
+    if (full) needFull = true;
+    if (scanTimer) return;
+    const wait = Math.max(60, 450 - (performance.now() - lastScanAt));
+    scanTimer = setTimeout(() => {
+      scanTimer = null;
+      lastScanAt = performance.now();
+      scan();
+    }, wait);
   }
 
-  function distinctLongNumbers(text) {
-    const m = text.match(LONG_NUM);
-    return m ? new Set(m).size : 0;
+  let lastRescan = 0;
+  function requestRescan() {
+    if (Date.now() - lastRescan < 3000) return;
+    lastRescan = Date.now();
+    window.postMessage({ source: 'BAP_CS', type: 'rescan' }, location.origin);
   }
 
-  function blockAncestor(el) {
-    while (el && el.parentElement && getComputedStyle(el).display.startsWith('inline')) el = el.parentElement;
-    return el;
+  function purgeCards() {
+    let changed = false;
+    for (const [id, c] of native.cards) {
+      if (c.root.isConnected && c.host.isConnected) continue;
+      if (c.root.isConnected) {
+        c.root.removeAttribute('data-bap-card');
+        c.root.removeAttribute('data-bap-hide');
+        c.root.style.removeProperty('order');
+      }
+      c.host.remove();
+      native.cards.delete(id);
+      changed = true;
+    }
+    if (changed) native.version++;
+    return changed;
   }
 
-  // Sube desde el texto "Identificador de la biblioteca: …" hasta la caja que es la tarjeta completa.
-  function cardRootFor(textNode) {
-    let el = blockAncestor(textNode.parentElement);
-    if (!el) return null;
-    let w = el.getBoundingClientRect().width;
-    while (el.parentElement && el.parentElement !== document.body && el.parentElement !== document.documentElement) {
+  function clearNative() {
+    for (const c of native.cards.values()) {
+      c.root.removeAttribute('data-bap-card');
+      c.root.removeAttribute('data-bap-hide');
+      c.root.style.removeProperty('order');
+      c.host.remove();
+    }
+    native.cards.clear();
+    native.version++;
+    unflatten();
+  }
+
+  // Cantidad de IDs de anuncios conocidos dentro de un elemento (con caché por pasada).
+  function countKnown(el, cache) {
+    let n = cache.get(el);
+    if (n !== undefined) return n;
+    n = 0;
+    const m = (el.textContent || '').match(LONG_NUM);
+    if (m) {
+      const s = new Set();
+      for (const x of m) if (state.ads.has(x)) s.add(x);
+      n = s.size;
+    }
+    cache.set(el, n);
+    return n;
+  }
+
+  // Sube desde "Identificador de la biblioteca: …" hasta la caja más grande que contiene solo ese anuncio.
+  // Solo cuenta IDs de anuncios conocidos, así un teléfono de 13 dígitos en el texto no confunde la detección.
+  function cardRootFor(textNode, cache) {
+    let el = textNode.parentElement;
+    while (el && el.parentElement && el.parentElement !== document.body) {
       const p = el.parentElement;
-      const pw = p.getBoundingClientRect().width;
-      if (w > 0 && pw > w * 1.8) break;
-      if (distinctLongNumbers(p.textContent || '') > 1) break;
+      if (countKnown(p, cache) > 1) break;
+      if (p.querySelector(STOP_SEL)) break;
       el = p;
-      w = pw;
     }
     return el;
   }
 
   function findDetailsButton(root) {
-    const cands = root.querySelectorAll('div, a, span, [role="button"]');
-    for (const el of cands) {
-      const t = (el.textContent || '').trim();
-      if (t.length > 40 || !DETAILS_RE.test(t)) continue;
-      // El contenedor más externo que solo tiene ese botón.
-      let target = el;
-      while (target.parentElement && target.parentElement !== root) {
+    const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    let tn;
+    while ((tn = w.nextNode())) {
+      const t = tn.data.trim();
+      if (!t || t.length > 40 || !DETAILS_RE.test(t)) continue;
+      let target = tn.parentElement;
+      while (target && target.parentElement && target.parentElement !== root) {
         const p = target.parentElement;
+        if ((p.textContent || '').trim() === t) {
+          target = p;
+          continue;
+        }
         const cs = getComputedStyle(p);
-        const isRow = cs.display.includes('flex') && !cs.flexDirection.startsWith('column');
-        if ((p.textContent || '').trim() === t || isRow) target = p;
+        if (cs.display.includes('flex') && !cs.flexDirection.startsWith('column') && p.children.length <= 3) target = p;
         else break;
       }
       return target;
@@ -660,40 +748,73 @@
     return null;
   }
 
-  function scan() {
-    if (!state.ads.size || !document.body) return;
-    // Limpia tarjetas que Facebook quitó de la página.
-    for (const [id, c] of native.cards) if (!c.root.isConnected || !c.host.isConnected) native.cards.delete(id);
+  function candidatesIn(ctx, out) {
+    if (ctx.nodeType === 3) {
+      if (HAS_ID.test(ctx.data)) out.push(ctx);
+      return;
+    }
+    const snap = document.evaluate(DIGITS_XPATH, ctx, null, XPathResult.UNORDERED_NODE_SNAPSHOT_TYPE, null);
+    for (let i = 0; i < snap.snapshotLength; i++) out.push(snap.snapshotItem(i));
+  }
 
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
-      acceptNode(n) {
-        if (n.nodeType === 1) {
-          const name = n.localName;
-          if (n.hasAttribute('data-bap-card') || name.startsWith('bap-') || name === 'script' || name === 'style' || name === 'noscript' || n.getAttribute('role') === 'dialog') {
-            return NodeFilter.FILTER_REJECT;
-          }
-          return NodeFilter.FILTER_SKIP;
-        }
-        return LONG_NUM.test(n.data) ? ((LONG_NUM.lastIndex = 0), NodeFilter.FILTER_ACCEPT) : ((LONG_NUM.lastIndex = 0), NodeFilter.FILTER_SKIP);
-      },
-    });
+  function scan() {
+    if (!document.body) return;
+    const t0 = performance.now();
+    const purged = purgeCards();
+    // Si Facebook volvió a dibujar tarjetas, revisamos toda la página para reconectarlas.
+    const full = needFull || purged;
+    needFull = false;
+    const nodes = full ? [document.body] : [...pendingNodes].filter((n) => n.isConnected);
+    pendingNodes.clear();
+    if (!state.ads.size || !nodes.length) {
+      if (purged) scheduleRender();
+      return;
+    }
+
+    // 1) Candidatos: textos con 13+ dígitos (búsqueda nativa del navegador).
+    const texts = [];
+    for (const n of nodes) candidatesIn(n, texts);
     const found = [];
-    let n;
-    while ((n = walker.nextNode())) {
-      const ids = (n.data.match(LONG_NUM) || []).filter((x) => state.ads.has(x));
-      if (ids.length === 1 && !native.cards.has(ids[0])) found.push([ids[0], n]);
+    let unknown = 0;
+    for (const tn of texts) {
+      const m = tn.data.match(LONG_NUM);
+      if (!m) continue;
+      const ids = m.filter((x) => state.ads.has(x));
+      if (ids.length !== 1) {
+        if (!ids.length && ID_LABEL.test(tn.data.trim())) unknown++;
+        continue;
+      }
+      if (native.cards.has(ids[0])) continue;
+      const pe = tn.parentElement;
+      if (!pe || pe.closest('[role="dialog"], [data-bap-card]')) continue;
+      found.push([ids[0], tn]);
     }
-    for (const [id, textNode] of found) {
-      if (native.cards.has(id) || !textNode.isConnected) continue;
-      const root = cardRootFor(textNode);
-      if (!root || root.closest('[data-bap-card]') || root.querySelector('[data-bap-card]')) continue;
-      root.setAttribute('data-bap-card', id);
-      const host = buildCardBar(state.ads.get(id), root);
-      native.cards.set(id, { root, host });
+
+    // 2) Lectura: ubicar la tarjeta y el botón "Ver detalles" de cada una.
+    const cache = new Map();
+    const plans = [];
+    const used = new Set();
+    for (const [id, tn] of found) {
+      if (plans.some((p) => p.id === id)) continue;
+      const root = cardRootFor(tn, cache);
+      if (!root || used.has(root) || root === document.body || root.querySelector('[data-bap-card]')) continue;
+      used.add(root);
+      plans.push({ id, root, details: findDetailsButton(root) });
     }
+
+    // 3) Escritura: marcar tarjetas e insertar los botones.
+    for (const p of plans) {
+      p.root.setAttribute('data-bap-card', p.id);
+      const host = buildCardBar(state.ads.get(p.id), p.root, p.details);
+      native.cards.set(p.id, { root: p.root, host, hidden: false, sel: false, order: '' });
+    }
+    if (plans.length) native.version++;
+    if (unknown) requestRescan();
     if (native.cards.size) placeToolbar();
-    if (found.length) applyNative();
+    if (plans.length || purged) scheduleRender();
     updateFallback();
+    const dt = performance.now() - t0;
+    if (dt > 40) console.debug(`[BAP] scan ${full ? 'completo' : 'parcial'} ${dt.toFixed(0)}ms · ${plans.length} tarjetas nuevas · ${native.cards.size} total`);
   }
 
   // ---------- Barra dentro de cada tarjeta ----------
@@ -721,7 +842,7 @@
       <button class="btn btn-primary btn-lg btn-block" data-action="download" ${n ? '' : 'disabled'}>${icon('download', 16)}${dl}</button>`;
   }
 
-  function buildCardBar(ad, root) {
+  function buildCardBar(ad, root, details) {
     const host = document.createElement('bap-cardbar');
     host.dataset.id = ad.id;
     const sr = makeShadow(host);
@@ -736,15 +857,12 @@
       const cur = state.ads.get(host.dataset.id);
       if (cur) cardAction(btn.dataset.action, cur, btn);
     });
-    const details = findDetailsButton(root);
-    if (details && details.parentElement) {
+    if (details && details.parentElement && root.contains(details)) {
       details.parentElement.insertBefore(host, details);
     } else {
       wrap.classList.add('nb-top');
       root.insertBefore(host, root.firstChild);
     }
-    host.classList.toggle('sel', state.selected.has(ad.id));
-    wrap.classList.toggle('selected', state.selected.has(ad.id));
     return host;
   }
 
@@ -766,71 +884,96 @@
   function setSelectedUI(id) {
     const on = state.selected.has(id);
     const c = native.cards.get(id);
-    if (c) c.host.shadowRoot.querySelector('.nb').classList.toggle('selected', on);
+    if (c && c.sel !== on) {
+      c.sel = on;
+      c.host.shadowRoot.querySelector('.nb').classList.toggle('selected', on);
+    }
     const el = overlayCards.get(id);
     if (el) el.classList.toggle('selected', on);
   }
 
   // ---------- Filtros y orden sobre las tarjetas de Facebook ----------
-  function setAttr(el, name, on) {
-    if (on && !el.hasAttribute(name)) el.setAttribute(name, '');
-    else if (!on && el.hasAttribute(name)) el.removeAttribute(name);
-  }
-
   function lca(nodes) {
-    let a = nodes[0].parentElement;
-    while (a && !nodes.every((n) => a.contains(n))) a = a.parentElement;
-    return a;
+    const index = new Map();
+    const anc = [];
+    for (let a = nodes[0].parentElement; a; a = a.parentElement) {
+      index.set(a, anc.length);
+      anc.push(a);
+    }
+    let best = 0;
+    for (let i = 1; i < nodes.length; i++) {
+      let n = nodes[i].parentElement;
+      while (n && !index.has(n)) n = n.parentElement;
+      if (!n) return null;
+      best = Math.max(best, index.get(n));
+    }
+    return anc[best] || null;
   }
 
+  // Solo escribe en la página lo que cambió.
   function applyNative() {
-    if (!native.cards.size) return;
+    if (!native.cards.size) {
+      if (native.grid) unflatten();
+      return;
+    }
     const sorting = state.sort !== 'default';
     const order = sorting ? new Map(state.view.map((a, i) => [a.id, i])) : null;
     for (const [id, c] of native.cards) {
-      if (!c.root.isConnected) {
-        native.cards.delete(id);
-        continue;
+      const hide = !state.viewIds.has(id);
+      if (hide !== c.hidden) {
+        c.hidden = hide;
+        if (hide) c.root.setAttribute('data-bap-hide', '');
+        else c.root.removeAttribute('data-bap-hide');
       }
-      setAttr(c.root, 'data-bap-hide', !state.viewIds.has(id));
       setSelectedUI(id);
-      if (sorting) c.root.style.setProperty('order', String(order.has(id) ? order.get(id) : 99999));
-      else if (c.root.style.order) c.root.style.removeProperty('order');
+      const o = sorting ? String(order.has(id) ? order.get(id) : 99999) : '';
+      if (o !== c.order) {
+        c.order = o;
+        if (o) c.root.style.setProperty('order', o);
+        else c.root.style.removeProperty('order');
+      }
     }
-    if (sorting) flatten();
-    else unflatten();
+    if (sorting) {
+      if (native.flatVersion !== native.version || !native.grid) flatten();
+    } else if (native.grid) unflatten();
   }
 
   // Para ordenar entre los distintos bloques que arma Facebook, aplanamos los contenedores intermedios
   // (display: contents) y convertimos el contenedor común en una grilla. No movemos nodos de Facebook.
   function flatten() {
-    const roots = [...native.cards.values()].map((c) => c.root).filter((r) => r.isConnected);
+    native.flatVersion = native.version;
+    const roots = [...native.cards.values()].map((c) => c.root);
     if (roots.length < 2) return unflatten();
     const common = lca(roots);
-    if (!common || common === document.body) return unflatten();
+    if (!common || common === document.body || common === document.documentElement) return unflatten();
     const flat = new Set();
     for (const r of roots) {
       let p = r.parentElement;
-      while (p && p !== common) {
+      while (p && p !== common && !flat.has(p)) {
         flat.add(p);
         p = p.parentElement;
       }
     }
     for (const el of native.flat) if (!flat.has(el)) el.removeAttribute('data-bap-flat');
-    for (const el of flat) setAttr(el, 'data-bap-flat', true);
+    for (const el of flat) if (!el.hasAttribute('data-bap-flat')) el.setAttribute('data-bap-flat', '');
     if (native.grid && native.grid !== common) native.grid.removeAttribute('data-bap-grid');
-    setAttr(common, 'data-bap-grid', true);
+    if (!common.hasAttribute('data-bap-grid')) common.setAttribute('data-bap-grid', '');
     native.grid = common;
     native.flat = flat;
 
     // Lo que no es tarjeta (encabezados, "cargando…") va arriba o abajo de la grilla.
     let first = roots[0];
     for (const r of roots) if (r.compareDocumentPosition(first) & Node.DOCUMENT_POSITION_FOLLOWING) first = r;
-    const others = [...common.children, ...[...flat].flatMap((f) => [...f.children])].filter((el) => !el.hasAttribute('data-bap-card') && !el.hasAttribute('data-bap-flat'));
-    for (const el of others) {
-      const before = el.compareDocumentPosition(first) & Node.DOCUMENT_POSITION_FOLLOWING;
-      el.style.setProperty('order', before ? '-1' : '1000000');
-      native.ordered.add(el);
+    for (const el of native.ordered) el.style.removeProperty('order');
+    native.ordered = new Set();
+    const parents = [common, ...flat];
+    for (const par of parents) {
+      for (const el of par.children) {
+        if (el.hasAttribute('data-bap-card') || el.hasAttribute('data-bap-flat')) continue;
+        const before = el.compareDocumentPosition(first) & Node.DOCUMENT_POSITION_FOLLOWING;
+        el.style.setProperty('order', before ? '-1' : '1000000');
+        native.ordered.add(el);
+      }
     }
   }
 
@@ -841,11 +984,14 @@
     native.grid = null;
     for (const el of native.ordered) el.style.removeProperty('order');
     native.ordered = new Set();
+    native.flatVersion = -1;
   }
 
   function placeToolbar() {
     if (!tb || state.overlayOpen) return;
-    const roots = [...native.cards.values()].map((c) => c.root).filter((r) => r.isConnected);
+    if (native.tbVersion === native.version && tb.host.isConnected) return;
+    native.tbVersion = native.version;
+    const roots = [...native.cards.values()].map((c) => c.root);
     if (!roots.length) return;
     const anchor = native.grid || (roots.length > 1 ? lca(roots) : roots[0].parentElement);
     if (!anchor || !anchor.parentElement || anchor === document.body) return;
@@ -856,16 +1002,43 @@
   }
 
   // ---------- Observador de cambios de Facebook ----------
+  // Ignora casi todos los cambios (animaciones, videos, tooltips, contadores): solo toma en cuenta
+  // contenido nuevo que tenga el ID de un anuncio todavía sin botones, o la salida de una tarjeta nuestra.
+  const HAS_ID = /\d{13}/;
+  function wantsNode(text) {
+    if (!HAS_ID.test(text)) return false;
+    const m = text.match(LONG_NUM) || [];
+    for (const x of m) if (state.ads.has(x) && !native.cards.has(x)) return true;
+    // "Identificador…: 123…" de un anuncio sin datos todavía: sirve para pedir una relectura.
+    return /:\s*\d{13,20}/.test(text) && m.some((x) => !state.ads.has(x));
+  }
   function observePage() {
     const mo = new MutationObserver((muts) => {
+      let schedule = false;
       for (const m of muts) {
         for (const node of m.addedNodes) {
-          if (node.nodeType === 1 && !node.localName.startsWith('bap-')) return scheduleScan(300);
+          if (node.nodeType === 1) {
+            if (node.localName.startsWith('bap-')) continue;
+            if (wantsNode(node.textContent)) {
+              pendingNodes.add(node);
+              schedule = true;
+            }
+          } else if (node.nodeType === 3 && wantsNode(node.data)) {
+            pendingNodes.add(node);
+            schedule = true;
+          }
         }
-        for (const node of m.removedNodes) {
-          if (node.nodeType === 1 && !node.localName.startsWith('bap-')) return scheduleScan(300);
+        if (native.cards.size && !schedule) {
+          for (const node of m.removedNodes) {
+            if (node.nodeType !== 1 || node.localName.startsWith('bap-')) continue;
+            if (node.hasAttribute('data-bap-card') || node.querySelector('[data-bap-card]')) {
+              schedule = true;
+              break;
+            }
+          }
         }
       }
+      if (schedule) scheduleScan(false);
     });
     mo.observe(document.body, { childList: true, subtree: true });
   }
@@ -1174,12 +1347,14 @@
     if (open) {
       layer.overlayTop.appendChild(tb.host);
       tb.closeBtn.hidden = false;
-      renderOverlayGrid();
+      render();
     } else {
       layer.overlay.querySelectorAll('video').forEach((v) => v.pause());
       tb.closeBtn.hidden = true;
+      native.tbVersion = -1;
       if (native.cards.size) placeToolbar();
       else tb.host.remove();
+      render();
     }
   }
 
@@ -1384,7 +1559,7 @@
       layer = buildLayer();
       observePage();
       render();
-      scan();
+      scheduleScan(true);
     };
     if (document.body) start();
     else document.addEventListener('DOMContentLoaded', start, { once: true });

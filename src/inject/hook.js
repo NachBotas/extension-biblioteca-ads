@@ -28,6 +28,9 @@
     if (ev.source !== window || !ev.data || ev.data.source !== 'BAP_CS') return;
     if (ev.data.type === 'hello') {
       for (const msg of buffer) window.postMessage(msg, location.origin);
+    } else if (ev.data.type === 'rescan') {
+      // Hay tarjetas en pantalla sin datos: revisamos scripts de datos que llegaron tarde.
+      scanScripts();
     }
   });
 
@@ -89,7 +92,7 @@
     return { ads, meta };
   }
 
-  function handleText(text, origin) {
+  function handleText(text, origin, info) {
     const chunks = parseChunks(text);
     if (!chunks.length) return;
     const ads = [];
@@ -99,6 +102,8 @@
       ads.push(...r.ads);
       if (r.meta) meta = r.meta;
     }
+    // Primera página de una búsqueda (sin cursor): el content script decide si es una búsqueda nueva.
+    if (meta && info && info.firstPage) post('reset', { name: info.name });
     if (ads.length || meta) post('ads', { ads, meta, origin });
   }
 
@@ -122,24 +127,22 @@
 
   function describeRequest(body) {
     const p = bodyToParams(body);
-    if (!p) return { name: '', newSearch: false };
+    if (!p) return { name: '', firstPage: false };
     const name = p.get('fb_api_req_friendly_name') || '';
-    let newSearch = false;
-    if (/AdLibrarySearch/i.test(name)) {
-      try {
-        const vars = JSON.parse(p.get('variables') || '{}');
-        newSearch = !vars.cursor;
-      } catch (e) {
-        /* ignore */
-      }
+    let firstPage = false;
+    try {
+      const raw = p.get('variables');
+      if (raw) firstPage = !JSON.parse(raw).cursor;
+    } catch (e) {
+      /* ignore */
     }
-    return { name, newSearch };
+    return { name, firstPage };
   }
 
   function shouldProcess(info) {
-    // Ignoramos queries de detalle de un anuncio puntual (abrir "Ver detalles"), para no mezclar resultados.
-    if (info.name && !/Search|Pagination|AdLibrary(Main|Query)/i.test(info.name)) return false;
-    return true;
+    // Facebook usa distintos nombres de consulta para los resultados (y cambian con el tiempo),
+    // así que aceptamos todo salvo el detalle de un anuncio puntual ("Ver detalles").
+    return !(info.name && /Detail|Preview|Report|Typeahead/i.test(info.name));
   }
 
   // ---------- fetch ----------
@@ -151,14 +154,13 @@
       try {
         if (url && /\/(api\/)?graphql/.test(url)) {
           const info = describeRequest(init && init.body);
-          if (info.newSearch) post('reset', { name: info.name });
           if (shouldProcess(info)) {
             p.then((res) => {
               try {
                 res
                   .clone()
                   .text()
-                  .then((t) => handleText(t, 'fetch'))
+                  .then((t) => handleText(t, 'fetch', info))
                   .catch(() => {});
               } catch (e) {
                 /* ignore */
@@ -185,11 +187,10 @@
     try {
       if (this.__bapUrl && /\/(api\/)?graphql/.test(this.__bapUrl)) {
         const info = describeRequest(body);
-        if (info.newSearch) post('reset', { name: info.name });
         if (shouldProcess(info)) {
           this.addEventListener('load', () => {
             try {
-              if (this.responseType === '' || this.responseType === 'text') handleText(this.responseText, 'xhr');
+              if (this.responseType === '' || this.responseType === 'text') handleText(this.responseText, 'xhr', info);
             } catch (e) {
               /* ignore */
             }

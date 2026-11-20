@@ -51,4 +51,6 @@ Para actualizar a una versión nueva: reemplazá los archivos de la carpeta y to
 node test/e2e.js test/out
 ```
 
-Carga la extensión en Chromium sobre una Biblioteca simulada (`test/mock.js`) y prueba los filtros, el guardado, la descarga, la exportación y "Cargar todos". Deja capturas en `test/out/`.
+`node test/perf.js . 300` mide el rendimiento con 300 anuncios en una página que cambia todo el tiempo (`node test/perf.js none 300` mide la misma página sin la extensión, para comparar). Con `FILLER=150 DIGIT_NOISE=1` se simula un DOM pesado como el de Facebook.
+
+`test/e2e.js` carga la extensión en Chromium sobre una Biblioteca simulada (`test/mock.js`) y prueba los filtros, el guardado, la descarga, la exportación y "Cargar todos". Deja capturas en `test/out/`.
